@@ -190,79 +190,132 @@ class AsyncHttpClient:
         timeout_sec: float | None = None,
         max_bytes: int = 18 * 1024 * 1024,
     ) -> HttpStreamResult:
-        """按 64KB 分块流式下载并直接写入磁盘，仅保留前 32 字节用于格式嗅探，内存零驻留大图。"""
+        """按 64KB 分块流式直写磁盘，并在遭遇 CDN 回源截断 (`ContentLengthError`) 时自动发起 HTTP 206 断点续传。"""
         session = await self._get_session()
-        eff_timeout = aiohttp.ClientTimeout(total=timeout_sec or self._timeout_sec)
-        merged_headers = {"User-Agent": DEFAULT_USER_AGENT}
+        base_t = max(5.0, float(timeout_sec or self._timeout_sec))
+        eff_timeout = aiohttp.ClientTimeout(
+            total=max(60.0, base_t * 3),
+            sock_connect=min(15.0, base_t),
+            sock_read=base_t,
+        )
+        base_headers = {"User-Agent": DEFAULT_USER_AGENT}
         if headers:
-            merged_headers.update(headers)
+            base_headers.update(headers)
+
+        upper_method = method.upper()
+        allow_range_resume = upper_method == "GET" and json_body is None
+        max_segments = 4 if allow_range_resume else 1
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+        part_path.unlink(missing_ok=True)
 
-        async with session.request(
-            method.upper(),
-            url,
-            headers=merged_headers,
-            json=json_body,
-            timeout=eff_timeout,
-            proxy=self._proxy,
-        ) as resp:
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            if resp.status != 200:
-                err_buf = bytearray()
-                async for chunk in resp.content.iter_chunked(4096):
-                    err_buf.extend(chunk)
-                    if len(err_buf) >= 512:
-                        break
-                preview = bytes(err_buf[:256]).decode("utf-8", errors="replace")
-                return HttpStreamResult(
-                    status=resp.status,
-                    headers=resp_headers,
-                    size_bytes=0,
-                    head_bytes=b"",
-                    error_preview=preview,
-                )
+        head_buf = bytearray()
+        total_written = 0
+        expected_total: int | None = None
+        last_headers: dict[str, str] = {}
 
-            cl_str = resp_headers.get("content-length") or ""
-            if cl_str.isdigit() and int(cl_str) > max_bytes:
-                raise ValueError(f"远端声明文件体积超限 ({cl_str} > {max_bytes} bytes)")
+        try:
+            for seg_idx in range(max_segments):
+                req_headers = dict(base_headers)
+                if seg_idx > 0:
+                    # 发生中途断流后强制新建干净 TCP 连接，若已有落盘字节则携带 Range 断点续传
+                    req_headers["Connection"] = "close"
+                    if allow_range_resume and total_written > 0:
+                        req_headers["Range"] = f"bytes={total_written}-"
 
-            head_buf = bytearray()
-            total_written = 0
-            fd = await asyncio.to_thread(
-                os.open,
-                str(part_path),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o644,
-            )
-            try:
-                async for chunk in resp.content.iter_chunked(65536):
-                    if not chunk:
-                        continue
-                    if len(head_buf) < 32:
-                        need = 32 - len(head_buf)
-                        head_buf.extend(chunk[:need])
-                    total_written += len(chunk)
-                    if total_written > max_bytes:
-                        raise ValueError(
-                            f"流式下载体积超出安全上限 ({total_written} > {max_bytes} bytes)"
+                try:
+                    async with session.request(
+                        upper_method,
+                        url,
+                        headers=req_headers,
+                        json=json_body,
+                        timeout=eff_timeout,
+                        proxy=self._proxy,
+                    ) as resp:
+                        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                        last_headers = resp_headers
+
+                        if resp.status == 206 and total_written > 0:
+                            cr = resp_headers.get("content-range") or ""
+                            if not cr.startswith(f"bytes {total_written}-"):
+                                # 边缘节点返回了不匹配的 Range 偏移，安全回退为从头全量覆盖重写
+                                total_written = 0
+                                head_buf.clear()
+                                continue
+                            open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                        elif resp.status == 200:
+                            cl_str = resp_headers.get("content-length") or ""
+                            if cl_str.isdigit():
+                                cl_val = int(cl_str)
+                                if cl_val > max_bytes:
+                                    raise ValueError(
+                                        f"远端声明文件体积超限 ({cl_val} > {max_bytes} bytes)"
+                                    )
+                                expected_total = cl_val
+                            total_written = 0
+                            head_buf.clear()
+                            open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                        else:
+                            err_buf = bytearray()
+                            async for chunk in resp.content.iter_chunked(4096):
+                                err_buf.extend(chunk)
+                                if len(err_buf) >= 512:
+                                    break
+                            preview = bytes(err_buf[:256]).decode("utf-8", errors="replace")
+                            part_path.unlink(missing_ok=True)
+                            return HttpStreamResult(
+                                status=resp.status,
+                                headers=resp_headers,
+                                size_bytes=0,
+                                head_bytes=b"",
+                                error_preview=preview,
+                            )
+
+                        fd = await asyncio.to_thread(os.open, str(part_path), open_flags, 0o644)
+                        try:
+                            async for chunk in resp.content.iter_chunked(65536):
+                                if not chunk:
+                                    continue
+                                if len(head_buf) < 32:
+                                    need = 32 - len(head_buf)
+                                    head_buf.extend(chunk[:need])
+                                total_written += len(chunk)
+                                if total_written > max_bytes:
+                                    raise ValueError(
+                                        f"流式下载体积超出安全上限 ({total_written} > {max_bytes} bytes)"
+                                    )
+                                await asyncio.to_thread(os.write, fd, chunk)
+                        finally:
+                            await asyncio.to_thread(os.close, fd)
+
+                        if expected_total is not None and total_written < expected_total:
+                            raise aiohttp.ClientPayloadError(
+                                f"响应字节未完整接收 ({total_written}/{expected_total} bytes)"
+                            )
+
+                        await asyncio.to_thread(os.replace, part_path, dest_path)
+                        return HttpStreamResult(
+                            status=200,
+                            headers=last_headers,
+                            size_bytes=total_written,
+                            head_bytes=bytes(head_buf),
                         )
-                    await asyncio.to_thread(os.write, fd, chunk)
-            except BaseException:
-                await asyncio.to_thread(os.close, fd)
-                part_path.unlink(missing_ok=True)
-                raise
-            else:
-                await asyncio.to_thread(os.close, fd)
+                except (
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ServerDisconnectedError,
+                    asyncio.TimeoutError,
+                ):
+                    if seg_idx + 1 < max_segments:
+                        await asyncio.sleep(0.25 * (seg_idx + 1))
+                        continue
+                    raise
+        except BaseException:
+            part_path.unlink(missing_ok=True)
+            raise
 
-            await asyncio.to_thread(os.replace, part_path, dest_path)
-            return HttpStreamResult(
-                status=200,
-                headers=resp_headers,
-                size_bytes=total_written,
-                head_bytes=bytes(head_buf),
-            )
+        part_path.unlink(missing_ok=True)
+        raise aiohttp.ClientPayloadError(f"流式断点续传未能在上限轮次内完成: {url}")
 
     async def get(
         self,

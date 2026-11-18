@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.6 (2026-11-18)
+
+- **新增图片流式下载 HTTP 206 自动断点续传（解决 CDN 跨境回源半截断流 `ContentLengthError`）**：
+  - `AsyncHttpClient.stream_to_file()` 在遭遇 `ContentLengthError` / `ServerDisconnectedError` 中途截断时保留已落盘字节，自动新建干净连接（`Connection: close`）并携带 `Range: bytes=<offset>-` 续传拼接剩余字节；同时将超时控制细化为 `sock_read` 读空闲超时，彻底消除冷门旧章节回源偶发丢页。
+
 ## v0.1.5 (2026-11-18)
 
 - **优化超长单行本整卷（如 198+ 页 `34卷`）拉取与中途签名过期续传**：

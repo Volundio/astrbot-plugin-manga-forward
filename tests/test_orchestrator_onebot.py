@@ -740,3 +740,72 @@ async def test_tankobon_200_pages_mid_volume_sign_expiry_batch_refresh(tmp_path:
     assert [p.index for p in pages] == list(range(total_vol_pages))
     # 跨越 2 次签名过期窗口仅触发 2 次整章批量刷新（而非 130+ 次单页刷新风暴）
     assert refresh_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_http_stream_range_resume_on_content_length_truncation(tmp_path: Path) -> None:
+    """模拟 CDN 跨境回源半截断流 (`ContentLengthError`: received 179343 of 315122 bytes)，验证 HTTP 206 Range 自动断点续传拼接完整图片。"""
+    from core.http_client import AsyncHttpClient
+
+    full_img = VALID_PNG_BYTES + (b"PNG_BODY_DATA_0123456789ABCDEF" * 10503)
+    cut_offset = 179343
+    assert len(full_img) > cut_offset
+    received_ranges: list[str] = []
+
+    async def _handle_raw_tcp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            raw_req = await reader.readuntil(b"\r\n\r\n")
+            req_text = raw_req.decode("latin1")
+            range_hdr = ""
+            for line in req_text.splitlines():
+                if line.lower().startswith("range:"):
+                    range_hdr = line.split(":", 1)[1].strip()
+                    break
+            received_ranges.append(range_hdr)
+
+            if not range_hdr:
+                # 第 1 次请求：声明完整 Content-Length，但在 179343 字节处直接断开连接复现 ContentLengthError
+                hdr = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: image/png\r\n"
+                    f"Accept-Ranges: bytes\r\n"
+                    f"Content-Length: {len(full_img)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                writer.write(hdr + full_img[:cut_offset])
+                await writer.drain()
+            else:
+                # 第 2 次请求：校验客户端携带 Range: bytes=179343-，返回 HTTP 206 剩余字节
+                start_pos = int(range_hdr.removeprefix("bytes=").rstrip("-"))
+                tail = full_img[start_pos:]
+                hdr = (
+                    f"HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Type: image/png\r\n"
+                    f"Content-Range: bytes {start_pos}-{len(full_img) - 1}/{len(full_img)}\r\n"
+                    f"Content-Length: {len(tail)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                writer.write(hdr + tail)
+                await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(_handle_raw_tcp, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    http = AsyncHttpClient(timeout_sec=10.0)
+    out_file = tmp_path / "resumed_0033.png"
+    try:
+        res = await http.stream_to_file("GET", f"http://127.0.0.1:{port}/34.png", out_file)
+        assert res.status == 200
+        assert res.size_bytes == len(full_img)
+        assert len(received_ranges) >= 2
+        assert received_ranges[0] == ""
+        assert received_ranges[-1].startswith("bytes=")
+        resumed_from = int(received_ranges[-1].removeprefix("bytes=").rstrip("-"))
+        assert 0 < resumed_from <= cut_offset
+        assert out_file.read_bytes() == full_img
+    finally:
+        await http.close()
+        server.close()
+        await server.wait_closed()
