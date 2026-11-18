@@ -661,7 +661,7 @@ def test_restored_batch_defaults_and_adjustable_image_limits() -> None:
     assert default_cfg.delivery.max_mb_per_forward == 28
     assert default_cfg.network.download_concurrency == 6
     assert default_cfg.network.max_single_image_mb == 18
-    assert default_cfg.network.max_chapter_mb == 150
+    assert default_cfg.network.max_chapter_mb == 300
 
     custom_cfg = PluginConfig.from_mapping(
         {
@@ -673,3 +673,70 @@ def test_restored_batch_defaults_and_adjustable_image_limits() -> None:
     assert custom_cfg.delivery.max_mb_per_forward == 80
     assert custom_cfg.network.max_single_image_mb == 40
     assert custom_cfg.network.max_chapter_mb == 600
+
+
+@pytest.mark.asyncio
+async def test_tankobon_200_pages_mid_volume_sign_expiry_batch_refresh(tmp_path: Path) -> None:
+    """模拟拉取 198 页单行本整卷且中途跨越 2 次防盗链签名过期窗口，验证整章批量重刷零丢页且无重刷风暴。"""
+    from core.http_client import HttpStreamResult
+
+    total_vol_pages = 198
+    refresh_calls = 0
+
+    class _ExpiringSignTankobonSource(_StubSource):
+        async def refresh_all_page_urls(
+            self, manga: MangaCandidate, chapter: ChapterInfo
+        ) -> list[PageSpec] | None:
+            nonlocal refresh_calls
+            refresh_calls += 1
+            gen = refresh_calls + 1
+            return [
+                PageSpec(index=i, url=f"https://images.zaimanhua.com/v34/{i + 1:03d}.jpg?gen={gen}")
+                for i in range(total_vol_pages)
+            ]
+
+    class _ExpiringSignHttp:
+        async def stream_to_file(
+            self,
+            method: str,
+            url: str,
+            dest_path: Path,
+            **_: Any,
+        ) -> HttpStreamResult:
+            page_no = int(url.split("/v34/")[1].split(".")[0])
+            gen = int(url.split("gen=")[1])
+            # 模拟第 65 页起第 1 代签名过期返回 403，第 140 页起第 2 代签名再次过期返回 403
+            if (page_no >= 65 and gen < 2) or (page_no >= 140 and gen < 3):
+                return HttpStreamResult(status=403, headers={}, size_bytes=0, head_bytes=b"")
+            payload = VALID_PNG_BYTES + f"VOL_P_{page_no}".encode("ascii")
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(payload)
+            return HttpStreamResult(
+                status=200,
+                headers={},
+                size_bytes=len(payload),
+                head_bytes=payload[:32],
+            )
+
+    src = _ExpiringSignTankobonSource(SourceId.ZAIMANHUA, page_count=total_vol_pages)
+    dl = ChapterImageDownloader(_ExpiringSignHttp())  # type: ignore[arg-type]
+    cand = MangaCandidate(source=SourceId.ZAIMANHUA, manga_id="40956", title="女朋友、借我一下")
+    vol = ChapterInfo(chapter_id="156539", title="34卷", number=34.0, kind=ChapterKind.VOLUME)
+    init_specs = [
+        PageSpec(index=i, url=f"https://images.zaimanhua.com/v34/{i + 1:03d}.jpg?gen=1")
+        for i in range(total_vol_pages)
+    ]
+
+    pages = await dl.download_chapter_pages(
+        source=src,
+        manga=cand,
+        chapter=vol,
+        specs=init_specs,
+        dest_dir=tmp_path / "vol34",
+        concurrency=6,
+    )
+    assert len(pages) == total_vol_pages
+    assert all(p.local_path is not None and p.local_path.exists() for p in pages)
+    assert [p.index for p in pages] == list(range(total_vol_pages))
+    # 跨越 2 次签名过期窗口仅触发 2 次整章批量刷新（而非 130+ 次单页刷新风暴）
+    assert refresh_calls == 2

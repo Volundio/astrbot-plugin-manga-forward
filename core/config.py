@@ -88,7 +88,7 @@ class NetworkConfig:
     max_concurrent_tasks: int = 2
     max_waiting_tasks: int = 4
     max_single_image_mb: int = 18
-    max_chapter_mb: int = 150
+    max_chapter_mb: int = 300
     index_idle_unload_min: int = 10
     cache_max_age_hours: int = 72
 
@@ -228,7 +228,7 @@ class PluginConfig:
             max_concurrent_tasks=_clamp_int(net_raw.get("max_concurrent_tasks"), 2, 1, 16),
             max_waiting_tasks=_clamp_int(net_raw.get("max_waiting_tasks"), 4, 1, 50),
             max_single_image_mb=_clamp_int(net_raw.get("max_single_image_mb"), 18, 1, 500),
-            max_chapter_mb=_clamp_int(net_raw.get("max_chapter_mb"), 150, 5, 10240),
+            max_chapter_mb=_clamp_int(net_raw.get("max_chapter_mb"), 300, 5, 10240),
             index_idle_unload_min=_clamp_int(net_raw.get("index_idle_unload_min"), 10, 1, 1440),
             cache_max_age_hours=_clamp_int(net_raw.get("cache_max_age_hours"), 72, 1, 720),
         )

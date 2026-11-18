@@ -26,8 +26,8 @@ from .models import (
 from .sources.base import BaseMangaSource
 
 DEFAULT_MAX_SINGLE_IMAGE_BYTES = 18 * 1024 * 1024
-DEFAULT_MAX_CHAPTER_BYTES = 150 * 1024 * 1024
-MAX_TOTAL_TEMP_DIR_BYTES = 320 * 1024 * 1024
+DEFAULT_MAX_CHAPTER_BYTES = 300 * 1024 * 1024
+MAX_TOTAL_TEMP_DIR_BYTES = 512 * 1024 * 1024
 
 
 def detect_image_extension(data: bytes) -> str | None:
@@ -242,18 +242,44 @@ class ChapterImageDownloader:
         dest_dir.mkdir(parents=True, exist_ok=True)
         ordered_specs = sorted(specs, key=lambda s: s.index)
         total_pages = len(ordered_specs)
+        live_specs: list[PageSpec] = list(ordered_specs)
         slots: list[DownloadedPage | None] = [None] * total_pages
         single_cap = max(64 * 1024, max_single_image_bytes)
         chapter_cap = max(single_cap, max_chapter_bytes)
 
-        sem = asyncio.Semaphore(max(1, min(32, concurrency)))
-        refresh_lock = asyncio.Lock()
-        refreshed_once = False
+        # 针对 80 页以上的整卷单行本自动适度拉升流式并发度（默认至少 12 路），大幅缩短整卷拉取耗时
+        eff_concurrency = max(concurrency, 12) if total_pages >= 80 else concurrency
+        sem = asyncio.Semaphore(max(1, min(32, eff_concurrency)))
+        quota_lock = asyncio.Lock()
+        url_refresh_lock = asyncio.Lock()
+        refreshed_quota_once = False
         total_bytes = 0
         abort_exc: Exception | None = None
 
-        async def _download_one(slot_idx: int, spec: PageSpec) -> None:
-            nonlocal refreshed_once, total_bytes, abort_exc
+        async def _refresh_slot_spec(slot_idx: int, failed_url: str) -> PageSpec | None:
+            """当单页遇 401/403 签名过期时，串行整章重刷并同步更新全部待下载槽位的 `live_specs`，杜绝风暴。"""
+            async with url_refresh_lock:
+                if live_specs[slot_idx].url != failed_url:
+                    # 其他协程刚刚已完成整卷签名重刷，直接零开销复用最新 URL
+                    return live_specs[slot_idx]
+
+                batch_fn = getattr(source, "refresh_all_page_urls", None)
+                if callable(batch_fn):
+                    all_fresh = await batch_fn(manga, chapter)
+                    if all_fresh and len(all_fresh) == total_pages:
+                        ordered_fresh = sorted(all_fresh, key=lambda s: s.index)
+                        for idx_f, fresh_sp in enumerate(ordered_fresh):
+                            live_specs[idx_f] = fresh_sp
+                        return live_specs[slot_idx]
+
+                single_fresh = await source.refresh_single_page_url(manga, chapter, slot_idx)
+                if single_fresh is not None:
+                    live_specs[slot_idx] = single_fresh
+                    return single_fresh
+                return None
+
+        async def _download_one(slot_idx: int) -> None:
+            nonlocal refreshed_quota_once, total_bytes, abort_exc
             if abort_exc is not None:
                 return
 
@@ -261,11 +287,12 @@ class ChapterImageDownloader:
                 if abort_exc is not None:
                     return
 
-                cur_spec = spec
+                # 进入并发窗口时动态读取最新的 live_specs[slot_idx]（可能已被前序页自动刷成最新签名）
+                cur_spec = live_specs[slot_idx]
                 last_err = ""
                 raw_dest = dest_dir / f"{slot_idx + 1:04d}.raw"
 
-                for attempt in range(3):
+                for attempt in range(4):
                     if abort_exc is not None:
                         return
                     remaining_budget = chapter_cap - total_bytes
@@ -285,18 +312,16 @@ class ChapterImageDownloader:
                     except Exception as exc:
                         raw_dest.unlink(missing_ok=True)
                         last_err = str(exc)
-                        if attempt < 2:
-                            await asyncio.sleep(0.5 * (attempt + 1))
+                        if attempt < 3:
+                            await asyncio.sleep(0.4 * (attempt + 1))
                         continue
 
                     if st_res.status == 402:
                         raw_dest.unlink(missing_ok=True)
-                        async with refresh_lock:
-                            if not refreshed_once:
-                                refreshed_once = True
-                                new_spec = await source.refresh_single_page_url(
-                                    manga, chapter, slot_idx
-                                )
+                        async with quota_lock:
+                            if not refreshed_quota_once:
+                                refreshed_quota_once = True
+                                new_spec = await _refresh_slot_spec(slot_idx, cur_spec.url)
                                 if new_spec is not None:
                                     cur_spec = new_spec
                                     continue
@@ -305,9 +330,9 @@ class ChapterImageDownloader:
                         )
                         return
 
-                    if st_res.status in (401, 403) and attempt == 0:
+                    if st_res.status in (401, 403) and attempt < 3:
                         raw_dest.unlink(missing_ok=True)
-                        new_spec = await source.refresh_single_page_url(manga, chapter, slot_idx)
+                        new_spec = await _refresh_slot_spec(slot_idx, cur_spec.url)
                         if new_spec is not None:
                             cur_spec = new_spec
                             continue
@@ -315,23 +340,20 @@ class ChapterImageDownloader:
                     if st_res.status != 200:
                         raw_dest.unlink(missing_ok=True)
                         last_err = f"HTTP {st_res.status}"
-                        if attempt < 2:
-                            await asyncio.sleep(0.5 * (attempt + 1))
+                        if attempt < 3:
+                            await asyncio.sleep(0.4 * (attempt + 1))
                         continue
 
                     ext = detect_image_extension(st_res.head_bytes)
                     if ext is None:
                         raw_dest.unlink(missing_ok=True)
                         last_err = "响应内容非有效图片格式"
-                        if attempt == 0:
-                            new_spec = await source.refresh_single_page_url(
-                                manga, chapter, slot_idx
-                            )
-                            if new_spec is not None:
+                        if attempt < 3:
+                            new_spec = await _refresh_slot_spec(slot_idx, cur_spec.url)
+                            if new_spec is not None and new_spec.url != cur_spec.url:
                                 cur_spec = new_spec
                                 continue
-                        if attempt < 2:
-                            await asyncio.sleep(0.5 * (attempt + 1))
+                            await asyncio.sleep(0.4 * (attempt + 1))
                         continue
 
                     final_path = dest_dir / f"{slot_idx + 1:04d}{ext}"
@@ -355,10 +377,7 @@ class ChapterImageDownloader:
                     error=last_err or "下载失败",
                 )
 
-        tasks = [
-            asyncio.create_task(_download_one(slot_i, sp))
-            for slot_i, sp in enumerate(ordered_specs)
-        ]
+        tasks = [asyncio.create_task(_download_one(slot_i)) for slot_i in range(total_pages)]
         await asyncio.gather(*tasks, return_exceptions=True)
 
         if abort_exc is not None:

@@ -92,7 +92,7 @@ git clone https://github.com/Volundio/astrbot-plugin-manga-forward
   - `t2i_endpoint`：自定义远程 HTML 渲染服务（`astrbot-t2i-service`）地址，留空默认使用本机 AstrBot 已配置好的 `remote` 渲染服务。
   - `theme`：吐槽卡片视觉主题（`paper` 漫纸暖白 / `light` 现代纯白 / `dark` 夜间深色）。
   - `fallback_to_text`：远程渲染不可用时是否自动回退为纯文本节点。
-- **`delivery` & `network`**：合并转发首条概览开关、单批最大页数（`max_pages_per_forward`，默认 `60`，可自由调整）与单批最大体积上限（`max_mb_per_forward`，默认 `28MB`，可自由调整）、解析等待提示与自动撤回、HTTP 代理、并发连接数与最大排队任务上限（`max_waiting_tasks`）、单张图片体积上限（`max_single_image_mb`，默认 `18MB`，可自由调整）、单话累计体积上限（`max_chapter_mb`，默认 `150MB`，可自由调整）、再漫画内存索引空闲卸载时间（`index_idle_unload_min`）及本地缓存最长保留时长（`cache_max_age_hours`）。
+- **`delivery` & `network`**：合并转发首条概览开关、单批最大页数（`max_pages_per_forward`，默认 `60`，可自由调整）与单批最大体积上限（`max_mb_per_forward`，默认 `28MB`，可自由调整）、解析等待提示与自动撤回、HTTP 代理、并发连接数与最大排队任务上限（`max_waiting_tasks`）、单张图片体积上限（`max_single_image_mb`，默认 `18MB`，可自由调整）、单话/单卷累计体积上限（`max_chapter_mb`，默认 `300MB`，可自由调整）、再漫画内存索引空闲卸载时间（`index_idle_unload_min`）及本地缓存最长保留时长（`cache_max_age_hours`）。
 
 ---
 

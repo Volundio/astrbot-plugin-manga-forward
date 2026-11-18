@@ -30,6 +30,14 @@ class BaseMangaSource(ABC):
     ) -> list[PageSpec]:
         """拉取指定话数的全部图片规格，必须严格按真实页序 0..N-1 返回。"""
 
+    async def refresh_all_page_urls(
+        self,
+        manga: MangaCandidate,
+        chapter: ChapterInfo,
+    ) -> list[PageSpec] | None:
+        """当整卷/长章节下载中途防盗链签名批量过期 (401/403) 时，一次性重刷整章签名 URL 列表。"""
+        return None
+
     async def refresh_single_page_url(
         self,
         manga: MangaCandidate,
@@ -37,6 +45,9 @@ class BaseMangaSource(ABC):
         page_index: int,
     ) -> PageSpec | None:
         """当单页图片防盗链签名过期 (403) 时，可选重刷章节获取最新签名 URL。"""
+        refreshed = await self.refresh_all_page_urls(manga, chapter)
+        if refreshed is not None and 0 <= page_index < len(refreshed):
+            return refreshed[page_index]
         return None
 
     async def fetch_chapter_comments(

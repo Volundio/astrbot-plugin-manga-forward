@@ -257,7 +257,11 @@ class ZaimanhuaSource(BaseMangaSource):
             h5_headers = await self._build_headers(platform="h5", force_refresh=force)
             params: dict[str, Any] = {"_v": "2.2.5"}
             if bust_cache:
-                params["_t"] = int(time.time() * 1000)
+                now_ms = int(time.time() * 1000)
+                params["_t"] = now_ms
+                params["timestamp"] = now_ms // 1000
+                h5_headers["Cache-Control"] = "no-cache"
+                h5_headers["Pragma"] = "no-cache"
 
             urls: list[str] = []
             need_reauth = False
@@ -329,30 +333,39 @@ class ZaimanhuaSource(BaseMangaSource):
             f"再漫画未能获取到《{manga.title}》{chapter.title} 的图片列表（可能需要登录或提升账号等级）"
         )
 
+    async def refresh_all_page_urls(
+        self,
+        manga: MangaCandidate,
+        chapter: ChapterInfo,
+    ) -> list[PageSpec] | None:
+        """整卷单行本长耗时下载中途签名过期时，串行重刷一次整章最新签名 URL 并短时共享。"""
+        key = (manga.manga_id, chapter.chapter_id)
+        try:
+            async with self._refresh_pages_lock:
+                now = time.monotonic()
+                cached = self._refreshed_pages_cache.get(key)
+                if cached is not None and (now - cached[0]) < 8.0:
+                    return cached[1]
+                refreshed = await self._fetch_chapter_pages_internal(
+                    manga, chapter, bust_cache=True
+                )
+                if len(self._refreshed_pages_cache) >= 8:
+                    self._refreshed_pages_cache.clear()
+                self._refreshed_pages_cache[key] = (now, refreshed)
+                return refreshed
+        except Exception as exc:
+            logger.debug(f"再漫画批量刷新章节签名 URL 失败 ({manga.title} {chapter.title}): {exc}")
+            return None
+
     async def refresh_single_page_url(
         self,
         manga: MangaCandidate,
         chapter: ChapterInfo,
         page_index: int,
     ) -> PageSpec | None:
-        key = (manga.manga_id, chapter.chapter_id)
-        try:
-            async with self._refresh_pages_lock:
-                now = time.monotonic()
-                cached = self._refreshed_pages_cache.get(key)
-                if cached is not None and (now - cached[0]) < 15.0:
-                    refreshed = cached[1]
-                else:
-                    refreshed = await self._fetch_chapter_pages_internal(
-                        manga, chapter, bust_cache=True
-                    )
-                    if len(self._refreshed_pages_cache) >= 8:
-                        self._refreshed_pages_cache.clear()
-                    self._refreshed_pages_cache[key] = (now, refreshed)
-            if 0 <= page_index < len(refreshed):
-                return refreshed[page_index]
-        except Exception as exc:
-            logger.debug(f"再漫画刷新单页签名 URL 失败 (page={page_index}): {exc}")
+        refreshed = await self.refresh_all_page_urls(manga, chapter)
+        if refreshed is not None and 0 <= page_index < len(refreshed):
+            return refreshed[page_index]
         return None
 
     async def fetch_chapter_comments(
