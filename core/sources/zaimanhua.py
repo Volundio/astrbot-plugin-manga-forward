@@ -166,26 +166,31 @@ class ZaimanhuaSource(BaseMangaSource):
 
             v4_data: dict[str, Any] = {}
             need_reauth = False
-            resp = await self._http.get(
-                f"{ZMH_V4_API_BASE}/comic/detail/{manga_id}",
-                params={"_v": "2.2.5"},
-                headers=headers,
-            )
-            if resp.status == 401:
-                need_reauth = True
-            elif resp.status == 200:
-                payload = resp.json()
-                errno = payload.get("errno", 0)
-                if errno == 99:
+            try:
+                resp = await self._http.get(
+                    f"{ZMH_V4_API_BASE}/comic/detail/{manga_id}",
+                    params={"_v": "2.2.5"},
+                    headers=headers,
+                )
+                if resp.status == 401:
                     need_reauth = True
-                else:
-                    wrapper = payload.get("data")
-                    if isinstance(wrapper, dict):
-                        v4_data = (
-                            wrapper.get("data")
-                            if isinstance(wrapper.get("data"), dict)
-                            else wrapper
-                        )
+                elif resp.status == 200:
+                    payload = resp.json()
+                    errno = payload.get("errno", 0)
+                    if errno == 99:
+                        need_reauth = True
+                    else:
+                        wrapper = payload.get("data")
+                        if isinstance(wrapper, dict):
+                            v4_data = (
+                                wrapper.get("data")
+                                if isinstance(wrapper.get("data"), dict)
+                                else wrapper
+                            )
+            except Exception as v4_exc:
+                logger.debug(
+                    f"再漫画 v4 详情接口异常，将自动切换 PC 端 comic2 接口兜底 (id={manga_id}): {v4_exc}"
+                )
 
             if need_reauth and attempt == 0 and self._has_relogin_capability():
                 logger.info(f"再漫画登录态已失效，正在自动重登后重试详情 (id={manga_id})…")
@@ -202,27 +207,30 @@ class ZaimanhuaSource(BaseMangaSource):
                 logger.info(f"再漫画章节可读状态受限，尝试刷新登录态重试 (id={manga_id})…")
                 continue
 
-            # 若标记隐藏章节或 v4 章节为空，调用 PC 端 comic2/comic/detail 补全完整章节
+            # 若标记隐藏章节、v4 章节为空或 v4 网络异常，调用 PC 端 comic2/comic/detail 补全完整章节
             if is_hide_chapter or not raw_groups:
-                pc_resp = await self._http.get(
-                    f"{ZMH_PC_API_BASE}/comic/detail",
-                    params={"id": manga_id},
-                    headers=headers,
-                )
-                if pc_resp.status == 200:
-                    pc_payload = pc_resp.json()
-                    if (
-                        pc_payload.get("errno") == 99
-                        and attempt == 0
-                        and self._has_relogin_capability()
-                    ):
-                        continue
-                    comic_info = (pc_payload.get("data") or {}).get("comicInfo") or {}
-                    pc_groups = comic_info.get("chapterList") or []
-                    if pc_groups:
-                        raw_groups = pc_groups
-                    if comic_info.get("title") and manga.title.startswith("再漫画#"):
-                        manga.title = str(comic_info["title"])
+                try:
+                    pc_resp = await self._http.get(
+                        f"{ZMH_PC_API_BASE}/comic/detail",
+                        params={"id": manga_id},
+                        headers=headers,
+                    )
+                    if pc_resp.status == 200:
+                        pc_payload = pc_resp.json()
+                        if (
+                            pc_payload.get("errno") == 99
+                            and attempt == 0
+                            and self._has_relogin_capability()
+                        ):
+                            continue
+                        comic_info = (pc_payload.get("data") or {}).get("comicInfo") or {}
+                        pc_groups = comic_info.get("chapterList") or []
+                        if pc_groups:
+                            raw_groups = pc_groups
+                        if comic_info.get("title") and manga.title.startswith("再漫画#"):
+                            manga.title = str(comic_info["title"])
+                except Exception as pc_exc:
+                    logger.debug(f"再漫画 PC 详情接口请求异常 (id={manga_id}): {pc_exc}")
 
             chapters = self._parse_chapter_groups(manga_id, raw_groups)
             if chapters:
@@ -267,52 +275,62 @@ class ZaimanhuaSource(BaseMangaSource):
             need_reauth = False
             denied_msg = ""
 
-            resp = await self._http.get(
-                f"{ZMH_V4_API_BASE}/comic/chapter/{manga_id}/{chapter_id}",
-                params=params,
-                headers=h5_headers,
-            )
-            if resp.status == 401:
-                need_reauth = True
-            elif resp.status == 200:
-                payload = resp.json()
-                errno = payload.get("errno", 0)
-                if errno == 99:
-                    need_reauth = True
-                else:
-                    inner = ((payload.get("data") or {}).get("data")) or {}
-                    can_read = inner.get("canRead", True)
-                    if can_read is False:
-                        need_reauth = True
-                        denied_msg = "再漫画当前章节不可读（未登录或账号等级权限不足）"
-                    raw_hd = inner.get("page_url_hd")
-                    raw_std = inner.get("page_url")
-                    chosen = raw_hd if (isinstance(raw_hd, list) and raw_hd) else raw_std
-                    if isinstance(chosen, list):
-                        urls = [str(u).strip() for u in chosen if str(u).strip()]
-
-            # 若 App h5 接口未拿到图片，尝试 PC comic2/chapter/detail 兜底
-            if not urls:
-                pc_headers = await self._build_headers(platform="pc", force_refresh=force)
-                pc_params: dict[str, Any] = {
-                    "comic_id": manga_id,
-                    "chapter_id": chapter_id,
-                }
-                if bust_cache:
-                    pc_params["_t"] = int(time.time() * 1000)
-                pc_resp = await self._http.get(
-                    f"{ZMH_PC_API_BASE}/chapter/detail",
-                    params=pc_params,
-                    headers=pc_headers,
+            try:
+                resp = await self._http.get(
+                    f"{ZMH_V4_API_BASE}/comic/chapter/{manga_id}/{chapter_id}",
+                    params=params,
+                    headers=h5_headers,
                 )
-                if pc_resp.status == 200:
-                    pc_json = pc_resp.json()
-                    if pc_json.get("errno") == 99:
+                if resp.status == 401:
+                    need_reauth = True
+                elif resp.status == 200:
+                    payload = resp.json()
+                    errno = payload.get("errno", 0)
+                    if errno == 99:
                         need_reauth = True
-                    ch_info = ((pc_json.get("data") or {}).get("chapterInfo")) or {}
-                    pc_urls = ch_info.get("page_url_hd") or ch_info.get("page_url")
-                    if isinstance(pc_urls, list):
-                        urls = [str(u).strip() for u in pc_urls if str(u).strip()]
+                    else:
+                        inner = ((payload.get("data") or {}).get("data")) or {}
+                        can_read = inner.get("canRead", True)
+                        if can_read is False:
+                            need_reauth = True
+                            denied_msg = "再漫画当前章节不可读（未登录或账号等级权限不足）"
+                        raw_hd = inner.get("page_url_hd")
+                        raw_std = inner.get("page_url")
+                        chosen = raw_hd if (isinstance(raw_hd, list) and raw_hd) else raw_std
+                        if isinstance(chosen, list):
+                            urls = [str(u).strip() for u in chosen if str(u).strip()]
+            except Exception as v4_ch_exc:
+                logger.debug(
+                    f"再漫画 v4 章节图片接口异常，将切换 PC 端 comic2 接口兜底 ({manga_id}/{chapter_id}): {v4_ch_exc}"
+                )
+
+            # 若 App h5 接口未拿到图片或请求异常，自动无缝切换 PC comic2/chapter/detail 兜底
+            if not urls:
+                try:
+                    pc_headers = await self._build_headers(platform="pc", force_refresh=force)
+                    pc_params: dict[str, Any] = {
+                        "comic_id": manga_id,
+                        "chapter_id": chapter_id,
+                    }
+                    if bust_cache:
+                        pc_params["_t"] = int(time.time() * 1000)
+                    pc_resp = await self._http.get(
+                        f"{ZMH_PC_API_BASE}/chapter/detail",
+                        params=pc_params,
+                        headers=pc_headers,
+                    )
+                    if pc_resp.status == 200:
+                        pc_json = pc_resp.json()
+                        if pc_json.get("errno") == 99:
+                            need_reauth = True
+                        ch_info = ((pc_json.get("data") or {}).get("chapterInfo")) or {}
+                        pc_urls = ch_info.get("page_url_hd") or ch_info.get("page_url")
+                        if isinstance(pc_urls, list):
+                            urls = [str(u).strip() for u in pc_urls if str(u).strip()]
+                except Exception as pc_ch_exc:
+                    logger.debug(
+                        f"再漫画 PC 章节图片接口请求异常 ({manga_id}/{chapter_id}): {pc_ch_exc}"
+                    )
 
             if urls:
                 img_headers = {"Referer": ZMH_REFERER}

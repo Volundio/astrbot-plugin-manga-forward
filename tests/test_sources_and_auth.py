@@ -425,3 +425,76 @@ async def test_komiic_refresh_and_graphql_flow(tmp_path: Path) -> None:
     ]
     assert pages[0].headers["Referer"].endswith("/comic/294/chapter/c1/page/1")
     assert refreshed_jwt in pages[0].headers["Cookie"]
+
+
+@pytest.mark.asyncio
+async def test_zaimanhua_v4_disconnect_failover_to_pc_channel(tmp_path: Path) -> None:
+    """验证当再漫画 v4api 跨境连接超时/重置时，自动无感故障切换至 PC 端 comic2 接口，不会误回退下一漫画源。"""
+    import asyncio
+
+    http = _MockRouterHttp()
+    auth = AuthManager(tmp_path / "auth.json", http)  # type: ignore[arg-type]
+    valid_jwt = _make_jwt(int(time.time()) + 86400)
+    zmh_cfg = ZaimanhuaConfig(cookie=valid_jwt, prefer_cookie=True)
+
+    def _route(method: str, url: str, kwargs: dict[str, Any]) -> HttpResponseData | None:
+        if "v4api.zaimanhua.com" in url:
+            raise asyncio.TimeoutError("v4api cross-border timeout")
+        if "manhua.zaimanhua.com/api/v1/comic2/comic/detail" in url:
+            return HttpResponseData(
+                status=200,
+                headers={},
+                cookies={},
+                body=json.dumps(
+                    {
+                        "errno": 0,
+                        "data": {
+                            "comicInfo": {
+                                "title": "黑暗集会",
+                                "chapterList": [
+                                    {
+                                        "title": "连载",
+                                        "data": [
+                                            {
+                                                "chapter_id": 196804,
+                                                "chapter_title": "85话",
+                                                "updatetime": 1793848380,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                ).encode(),
+                url=url,
+            )
+        if "manhua.zaimanhua.com/api/v1/comic2/chapter/detail" in url:
+            return HttpResponseData(
+                status=200,
+                headers={},
+                cookies={},
+                body=json.dumps(
+                    {
+                        "errno": 0,
+                        "data": {
+                            "chapterInfo": {
+                                "page_url": [
+                                    "https://images.zaimanhua.com/h%2F85%2F001.jpg",
+                                    "https://images.zaimanhua.com/h%2F85%2F002.jpg",
+                                ]
+                            }
+                        },
+                    }
+                ).encode(),
+                url=url,
+            )
+        return None
+
+    http.handlers.append(_route)
+    source = ZaimanhuaSource(lambda: zmh_cfg, http, auth, object())  # type: ignore[arg-type]
+    cand = MangaCandidate(source=SourceId.ZAIMANHUA, manga_id="47682", title="黑暗集会")
+    chs = await source.fetch_chapters(cand)
+    assert len(chs) == 1 and chs[0].title == "85话"
+    specs = await source.fetch_chapter_pages(cand, chs[0])
+    assert len(specs) == 2 and "%2F" in specs[0].url

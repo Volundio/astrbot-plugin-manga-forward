@@ -107,6 +107,7 @@ class AsyncHttpClient:
                 limit=48,
                 limit_per_host=20,
                 ttl_dns_cache=300,
+                keepalive_timeout=15.0,
                 ssl=ssl_ctx,
             )
             self._session = aiohttp.ClientSession(
@@ -141,9 +142,14 @@ class AsyncHttpClient:
         if headers:
             merged_headers.update(headers)
 
-        async def _do_call(ssl_param: bool | None) -> HttpResponseData:
+        async def _do_call(
+            ssl_param: bool | None, *, force_close: bool = False
+        ) -> HttpResponseData:
+            req_headers = dict(merged_headers)
+            if force_close:
+                req_headers["Connection"] = "close"
             kwargs: dict[str, Any] = {
-                "headers": merged_headers,
+                "headers": req_headers,
                 "params": params,
                 "json": json_body,
                 "data": form_data,
@@ -172,12 +178,22 @@ class AsyncHttpClient:
                     url=str(resp.url),
                 )
 
-        try:
-            return await _do_call(None)
-        except aiohttp.ClientConnectorCertificateError:
-            if allow_ssl_Disable_retry:
-                return await _do_call(False)
-            raise
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await _do_call(None, force_close=(attempt > 0))
+            except aiohttp.ClientConnectorCertificateError as exc:
+                if allow_ssl_Disable_retry:
+                    return await _do_call(False, force_close=(attempt > 0))
+                raise exc
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
 
     async def stream_to_file(
         self,

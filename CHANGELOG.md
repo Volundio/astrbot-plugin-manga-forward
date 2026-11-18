@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.7 (2026-11-18)
+
+- **增强再漫画 API 双通道容灾与空闲连接重连重试**：
+  - `AsyncHttpClient.request()` 新增最多 3 次网络异常/超时自动重试（重试时强制 `Connection: close` 重建干净 TCP 连接，并将连接池 `keepalive_timeout` 调整为 `15s` 避免复用跨境半开死连接）。
+  - `ZaimanhuaSource` 章节列表与章节图片接口补全异常隔离：当 `v4api.zaimanhua.com` 跨境超时或断连时，不再直接跳出回退下一源，而是自动无缝切换至 `manhua.zaimanhua.com` PC 端接口获取章节与原图列表。
+
 ## v0.1.6 (2026-11-18)
 
 - **新增图片流式下载 HTTP 206 自动断点续传（解决 CDN 跨境回源半截断流 `ContentLengthError`）**：
