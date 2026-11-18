@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from core.chapter_matcher import (
+    analyze_chapter_meta,
     classify_chapter_meta,
     parse_chapter_target,
     select_matching_chapter,
@@ -151,3 +152,85 @@ def test_chapter_vs_volume_strict_isolation() -> None:
     with pytest.raises(ChapterNotFoundError) as exc_info:
         select_matching_chapter(chapters, parse_chapter_target("999"), "电锯人")
     assert "第120话" in str(exc_info.value)
+
+
+def test_volundio_multi_part_and_chapter_prefix_disambiguation() -> None:
+    """回归测试《異劍戰記Völundio》真实章节列表：解决 `第二话` 误命中 `第二章 13话` 问题。"""
+    raw_titles = [
+        "预告",
+        "第00话",
+        "第01话",
+        "第02话",
+        "短篇小剧场2",
+        "第13话①",
+        "第13话②",
+        "第01卷附录",
+        "03卷情报&发表",
+        "第54话试看",
+        "第二部第1话",
+        "第二部第2话",
+        "第二部 06话",
+        "45-54话的附加彩色插画",
+        "第二章  12话（前篇）",
+        "第二章 12话（后篇）",
+        "第二章 13话",
+        "第二部 17话",
+    ]
+    chapters: list[ChapterInfo] = []
+    for idx, t in enumerate(raw_titles):
+        meta = analyze_chapter_meta(t, "默認")
+        chapters.append(
+            ChapterInfo(
+                chapter_id=f"id_{idx}",
+                title=t,
+                number=meta.number,
+                part_number=meta.part_number,
+                sub_order=meta.sub_order,
+                is_trial=meta.is_trial,
+                kind=meta.kind,
+                group_name="默認",
+                order_index=idx,
+                page_count=33 if t == "第二章 13话" else 28,
+            )
+        )
+
+    # 1. `/manga 异剑战记 第二话` 必须精准命中第一部 `第02话`，绝不能误发 `第二章 13话` 或 `第二部第2话` 或 `短篇小剧场2`
+    cmd_p1_c2 = parse_manga_command("异剑战记 第二话")
+    assert cmd_p1_c2.manga_query == "异剑战记"
+    assert cmd_p1_c2.chapter_spec == "第二话"
+    matched_2 = select_matching_chapter(
+        chapters, parse_chapter_target(cmd_p1_c2.chapter_spec), "異劍戰記Völundio"
+    )
+    assert matched_2.title == "第02话"
+
+    # 2. `/manga 异剑战记 13话` 命中第一部 `第13话①`（而非第二章 13话，且 ① 优先于 ②）
+    matched_13 = select_matching_chapter(chapters, parse_chapter_target("13话"), "異劍戰記Völundio")
+    assert matched_13.title == "第13话①"
+
+    # 3. 显式指定分部/分章：`/manga 异剑战记 第二章 13话` 与 `/manga 异剑战记 第二部 13话` 均精准命中 `第二章 13话`
+    cmd_p2_13 = parse_manga_command("异剑战记 第二章 13话")
+    assert cmd_p2_13.manga_query == "异剑战记"
+    assert cmd_p2_13.chapter_spec == "第二章 13话"
+    assert (
+        select_matching_chapter(chapters, parse_chapter_target(cmd_p2_13.chapter_spec)).title
+        == "第二章 13话"
+    )
+    cmd_p2_13_bu = parse_manga_command("异剑战记 第二部 13话")
+    assert (
+        select_matching_chapter(chapters, parse_chapter_target(cmd_p2_13_bu.chapter_spec)).title
+        == "第二章 13话"
+    )
+
+    # 4. 指定子篇章后缀：`/manga 异剑战记 第二章 12话 后篇` 精准命中后篇
+    cmd_p2_12_hou = parse_manga_command("异剑战记 第二章 12话 后篇")
+    assert cmd_p2_12_hou.manga_query == "异剑战记"
+    assert (
+        select_matching_chapter(chapters, parse_chapter_target(cmd_p2_12_hou.chapter_spec)).title
+        == "第二章 12话（后篇）"
+    )
+
+    # 5. `45-54话的附加彩色插画` 绝不干扰 `第54话` 匹配
+    assert select_matching_chapter(chapters, parse_chapter_target("54话")).title == "第54话试看"
+
+    # 6. `最新话` 应正确识别第二部最新进度 `第二部 17话`（而非第一部的 54 话）
+    assert select_matching_chapter(chapters, parse_chapter_target("最新话")).title == "第二部 17话"

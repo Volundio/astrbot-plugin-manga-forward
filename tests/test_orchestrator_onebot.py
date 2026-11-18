@@ -120,14 +120,60 @@ class _StubSource(BaseMangaSource):
 
 @pytest.mark.asyncio
 async def test_priority_fallback_order_preservation_and_forward_nodes(tmp_path: Path) -> None:
+    from jinja2 import Environment
+
+    rendered_calls: list[dict[str, Any]] = []
+
+    class _MockHtmlRenderer:
+        async def render_custom_template(
+            self,
+            tmpl_str: str,
+            tmpl_data: dict[str, Any],
+            return_url: bool = False,
+            options: dict[str, Any] | None = None,
+            endpoint: str | None = None,
+        ) -> str:
+            # 真实编译并渲染 Jinja2 HTML 模板，确保 comments_card.html 零语法错误且转义安全
+            env = Environment(autoescape=True)
+            html_out = env.from_string(tmpl_str).render(**tmpl_data)
+            assert tmpl_data["manga_title"] in html_out
+            assert f"PAGE {tmpl_data['page_no']} OF {tmpl_data['total_pages']}" in html_out
+            rendered_calls.append(
+                {"tmpl_data": tmpl_data, "options": options, "endpoint": endpoint}
+            )
+            out_tmp = tmp_path / f"astrbot_t2i_out_{len(rendered_calls)}.png"
+            out_tmp.write_bytes(VALID_PNG_BYTES + f"CMT_PAGE_{len(rendered_calls)}".encode("ascii"))
+            return str(out_tmp)
+
+    mock_ctx = type(
+        "Ctx",
+        (),
+        {
+            "html_renderer": _MockHtmlRenderer(),
+            "get_config": lambda self, umo=None: {"t2i_endpoint": "http://127.0.0.1:8999"},
+        },
+    )()
+
     # 配置优先级：拷贝漫画 -> 再漫画 -> Komiic
-    # 其中拷贝漫画触发限流，自动降级至再漫画并成功拉取 4 页图片 + 章末吐槽
+    # 模拟 45 条章末吐槽，按每页 20 条切分为 3 页图片（20 + 20 + 5）
+    roast_45 = [
+        ChapterComment(
+            content=f"第{i}条章末神吐槽！", author=f"读者{i}" if i % 2 == 0 else "", likes=i
+        )
+        for i in range(1, 46)
+    ]
     raw_cfg = {
         "source_priority": ["copymanga", "zaimanhua", "komiic"],
-        "comments": {"enable_comments": True, "max_comments": 10},
+        "comments": {
+            "enable_comments": True,
+            "comments_per_page": 20,
+            "max_comments": 60,
+            "t2i_endpoint": "",
+            "theme": "paper",
+        },
         "delivery": {"include_header_node": True, "max_pages_per_forward": 10},
     }
-    orch = MangaForwardOrchestrator(tmp_path, lambda: raw_cfg)
+    orch = MangaForwardOrchestrator(tmp_path, lambda: raw_cfg, context=mock_ctx)
     orch._downloader = ChapterImageDownloader(_DelayedImageHttp())  # type: ignore[arg-type]
     orch._sources = {
         SourceId.COPYMANGA: _StubSource(
@@ -135,7 +181,7 @@ async def test_priority_fallback_order_preservation_and_forward_nodes(tmp_path: 
         ),
         SourceId.ZAIMANHUA: _StubSource(
             SourceId.ZAIMANHUA,
-            comments=[ChapterComment(content="神回预定！", likes=42)],
+            comments=roast_45,
             page_count=4,
         ),
         SourceId.KOMIIC: _StubSource(SourceId.KOMIIC),
@@ -147,10 +193,15 @@ async def test_priority_fallback_order_preservation_and_forward_nodes(tmp_path: 
         bundle = await orch.resolve_and_download(
             ParsedMangaCommand(manga_query="葬送的芙莉莲", chapter_spec="第1话"),
             scope,
+            umo="aiocqhttp:GroupMessage:654321",
         )
         assert bundle.source == SourceId.ZAIMANHUA
         assert [p.index for p in bundle.downloaded_pages] == [0, 1, 2, 3]
-        # 验证落盘文件字节严格对应 PAGE_1 .. PAGE_4，绝无因并发完成先后而乱序
+        # 验证 45 条吐槽被精确切分为 20 + 20 + 5 共 3 张渲染图片，且默认复用了本机 AstrBot 全局 t2i_endpoint
+        assert len(bundle.comment_image_paths) == 3
+        assert [len(c["tmpl_data"]["items"]) for c in rendered_calls] == [20, 20, 5]
+        assert rendered_calls[0]["endpoint"] == "http://127.0.0.1:8999/text2img"
+
         for expected_page_no, dp in enumerate(bundle.downloaded_pages, start=1):
             assert dp.local_path is not None
             raw_bytes = dp.local_path.read_bytes()
@@ -163,19 +214,107 @@ async def test_priority_fallback_order_preservation_and_forward_nodes(tmp_path: 
         )
         assert len(batches) == 1
         nodes = batches[0]
-        # 1 个概览头节点 + 4 个单图节点（每张图独占一条消息） + 1 个章末吐槽节点 = 6 个节点
-        assert len(nodes) == 6
+        # 1 个概览头节点 + 4 个漫画单图节点 + 3 个章末吐槽图片节点 = 8 个节点
+        assert len(nodes) == 8
         assert isinstance(nodes[0].content[0], Comp.Plain)
         for img_idx in range(1, 5):
             assert len(nodes[img_idx].content) == 1
             assert isinstance(nodes[img_idx].content[0], Comp.Image)
             assert f"({img_idx}/4)" in (nodes[img_idx].name or "")
-        assert isinstance(nodes[5].content[0], Comp.Plain)
-        assert "神回预定！" in nodes[5].content[0].text
+        for cmt_idx in range(1, 4):
+            c_node = nodes[4 + cmt_idx]
+            assert len(c_node.content) == 1
+            assert isinstance(c_node.content[0], Comp.Image)
+            assert f"章末吐槽 ({cmt_idx}/3)" in (c_node.name or "")
     finally:
         await scope.cleanup()
         await orch.close()
     assert not scope.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_comment_render_custom_endpoint_and_fallback_to_text(tmp_path: Path) -> None:
+    """验证自定义 t2i_endpoint 直连渲染，以及当远程 T2I 异常时平滑降级为文本节点。"""
+    posted_urls: list[str] = []
+
+    class _MockT2iHttp(_DelayedImageHttp):
+        async def post(self, url: str, **kwargs: Any) -> HttpResponseData:
+            posted_urls.append(url)
+            if "broken-t2i" in url:
+                return HttpResponseData(
+                    status=502, headers={}, cookies={}, body=b"Bad Gateway", url=url
+                )
+            return HttpResponseData(
+                status=200,
+                headers={"content-type": "image/png"},
+                cookies={},
+                body=VALID_PNG_BYTES + b"DIRECT_T2I",
+                url=url,
+            )
+
+    # 1. 自定义 t2i_endpoint 直连成功
+    cfg_ok = {
+        "source_priority": ["copymanga"],
+        "comments": {
+            "enable_comments": True,
+            "comments_per_page": 20,
+            "t2i_endpoint": "http://custom-t2i.local:8999",
+        },
+    }
+    orch_ok = MangaForwardOrchestrator(tmp_path, lambda: cfg_ok, context=None)
+    mock_http = _MockT2iHttp()
+    orch_ok._downloader = ChapterImageDownloader(mock_http)  # type: ignore[arg-type]
+    orch_ok._comment_renderer._http = mock_http  # type: ignore[assignment]
+    orch_ok._sources[SourceId.COPYMANGA] = _StubSource(
+        SourceId.COPYMANGA,
+        comments=[ChapterComment(content="自定义T2I渲染测试", author="路人A")],
+        page_count=2,
+    )
+    scope1 = TempDirManager(tmp_path / "temp").create_scope()
+    try:
+        b1 = await orch_ok.resolve_and_download(
+            ParsedMangaCommand(manga_query="异剑战记", chapter_spec="第1话"),
+            scope1,
+        )
+        assert posted_urls == ["http://custom-t2i.local:8999/text2img/generate"]
+        assert len(b1.comment_image_paths) == 1
+    finally:
+        await scope1.cleanup()
+        await orch_ok.close()
+
+    # 2. 远程 T2I 服务 502 故障时，自动回退为纯文本章末吐槽节点，绝不中断漫画发送
+    cfg_fb = {
+        "source_priority": ["copymanga"],
+        "comments": {
+            "enable_comments": True,
+            "t2i_endpoint": "http://broken-t2i.local:8999",
+            "fallback_to_text": True,
+        },
+    }
+    orch_fb = MangaForwardOrchestrator(tmp_path, lambda: cfg_fb, context=None)
+    orch_fb._downloader = ChapterImageDownloader(mock_http)  # type: ignore[arg-type]
+    orch_fb._comment_renderer._http = mock_http  # type: ignore[assignment]
+    orch_fb._sources[SourceId.COPYMANGA] = _StubSource(
+        SourceId.COPYMANGA,
+        comments=[ChapterComment(content="降级文本吐槽仍可达", author="路人B")],
+        page_count=2,
+    )
+    scope2 = TempDirManager(tmp_path / "temp").create_scope()
+    try:
+        b2 = await orch_fb.resolve_and_download(
+            ParsedMangaCommand(manga_query="异剑战记", chapter_spec="第1话"),
+            scope2,
+        )
+        assert b2.comment_image_paths == []
+        assert len(b2.comments) == 1
+        batches = build_forward_node_batches(
+            b2, PluginConfig.from_mapping(cfg_fb).delivery, bot_uin="10000"
+        )
+        assert isinstance(batches[0][-1].content[0], Comp.Plain)
+        assert "降级文本吐槽仍可达" in batches[0][-1].content[0].text
+    finally:
+        await scope2.cleanup()
+        await orch_fb.close()
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..auth_manager import AuthManager
-from ..chapter_matcher import classify_chapter_meta
+from ..chapter_matcher import analyze_chapter_meta
 from ..config import KomiicConfig
 from ..http_client import AsyncHttpClient
 from ..models import (
@@ -256,14 +256,17 @@ class KomiicSource(BaseMangaSource):
                 hint = None
                 grp = ctype
 
-            kind, num = classify_chapter_meta(display_title, grp, hint_kind=hint)
+            meta = analyze_chapter_meta(display_title, grp, hint_kind=hint)
             upd = _parse_iso_ts(str(item.get("dateUpdated") or item.get("dateCreated") or ""))
             chapters.append(
                 ChapterInfo(
                     chapter_id=cid,
                     title=display_title,
-                    number=num,
-                    kind=kind,
+                    number=meta.number,
+                    part_number=meta.part_number,
+                    sub_order=meta.sub_order,
+                    is_trial=meta.is_trial,
+                    kind=meta.kind,
                     group_name=grp,
                     order_index=idx,
                     page_count=int(item.get("size") or 0),

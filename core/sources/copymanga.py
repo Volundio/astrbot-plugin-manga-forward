@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from ..auth_manager import format_cookie_header
-from ..chapter_matcher import classify_chapter_meta
+from ..chapter_matcher import analyze_chapter_meta
 from ..config import CopymangaConfig
 from ..http_client import AsyncHttpClient
 from ..models import (
@@ -325,13 +325,16 @@ class CopymangaSource(BaseMangaSource):
                         cname = str(item.get("name") or "").strip()
                         if not uuid or not cname:
                             continue
-                        kind, num = classify_chapter_meta(cname, group_title)
+                        meta = analyze_chapter_meta(cname, group_title)
                         chapters.append(
                             ChapterInfo(
                                 chapter_id=uuid,
                                 title=cname,
-                                number=num,
-                                kind=kind,
+                                number=meta.number,
+                                part_number=meta.part_number,
+                                sub_order=meta.sub_order,
+                                is_trial=meta.is_trial,
+                                kind=meta.kind,
                                 group_name=group_title,
                                 order_index=int(item.get("ordered") or item.get("index") or seq),
                                 page_count=int(item.get("size") or 0),
@@ -415,13 +418,16 @@ class CopymangaSource(BaseMangaSource):
                         cname = str(item.get("name") or "").strip()
                         if not cid or not cname:
                             continue
-                        kind, num = classify_chapter_meta(cname, g_name)
+                        meta = analyze_chapter_meta(cname, g_name)
                         chapters.append(
                             ChapterInfo(
                                 chapter_id=cid,
                                 title=cname,
-                                number=num,
-                                kind=kind,
+                                number=meta.number,
+                                part_number=meta.part_number,
+                                sub_order=meta.sub_order,
+                                is_trial=meta.is_trial,
+                                kind=meta.kind,
                                 group_name=g_name,
                                 order_index=seq,
                                 url=f"https://{web_dom}/comic/{pw}/chapter/{cid}",

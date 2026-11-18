@@ -10,6 +10,7 @@ from astrbot.api import logger
 
 from .auth_manager import AuthManager
 from .chapter_matcher import parse_chapter_target, select_matching_chapter
+from .comment_renderer import CommentCardRenderer
 from .config import PluginConfig, redact_secrets
 from .http_client import AsyncHttpClient
 from .image_downloader import ChapterImageDownloader, TempScope
@@ -30,11 +31,18 @@ MIN_ACCEPT_MATCH_SCORE = 0.52
 
 
 class MangaForwardOrchestrator:
-    """核心业务编排器：按自定义源优先级检索、匹配章节、保序下载图片并拉取章末吐槽。"""
+    """核心业务编排器：按自定义源优先级检索、匹配章节、保序下载图片并渲染章末吐槽卡片。"""
 
-    def __init__(self, data_dir: Path, raw_config_getter: Any) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        raw_config_getter: Any,
+        *,
+        context: Any = None,
+    ) -> None:
         self._data_dir = data_dir
         self._get_raw_cfg = raw_config_getter
+        self._context = context
 
         cfg = self.current_config()
         self._http = AsyncHttpClient(
@@ -44,6 +52,7 @@ class MangaForwardOrchestrator:
         self._auth = AuthManager(data_dir / "auth_state.json", self._http)
         self._zmh_shadow = ZmhShadowSearchClient(data_dir / "zmh_index_cache", self._http)
         self._downloader = ChapterImageDownloader(self._http)
+        self._comment_renderer = CommentCardRenderer(context=context, http=self._http)
 
         self._sources: dict[SourceId, BaseMangaSource] = {
             SourceId.ZAIMANHUA: ZaimanhuaSource(
@@ -95,8 +104,10 @@ class MangaForwardOrchestrator:
         self,
         cmd: ParsedMangaCommand,
         temp_scope: TempScope,
+        *,
+        umo: str | None = None,
     ) -> ResolvedChapterBundle:
-        """在全局并发保护下按源优先级依次尝试解析并下载整话漫画。"""
+        """在全局并发保护下按源优先级依次尝试解析、下载整话图片并渲染章末吐槽图片。"""
         cfg = self.current_config()
         self._sync_runtime_limits(cfg)
         secrets = self._collect_secrets(cfg)
@@ -117,6 +128,7 @@ class MangaForwardOrchestrator:
                         target=target,
                         cfg=cfg,
                         temp_scope=temp_scope,
+                        umo=umo,
                     )
                     return bundle
                 except MangaForwardError as exc:
@@ -127,6 +139,7 @@ class MangaForwardOrchestrator:
                     )
                     attempts.append((src_id, safe_reason))
                     await temp_scope.clear_subdir(src_id.value)
+                    await temp_scope.clear_subdir(f"{src_id.value}_comments")
                 except Exception as exc:
                     safe_reason = redact_secrets(f"{type(exc).__name__}: {exc}", secrets)
                     logger.warning(
@@ -134,6 +147,7 @@ class MangaForwardOrchestrator:
                     )
                     attempts.append((src_id, safe_reason))
                     await temp_scope.clear_subdir(src_id.value)
+                    await temp_scope.clear_subdir(f"{src_id.value}_comments")
 
             raise AllSourcesFailedError(attempts)
 
@@ -145,6 +159,7 @@ class MangaForwardOrchestrator:
         target: Any,
         cfg: PluginConfig,
         temp_scope: TempScope,
+        umo: str | None = None,
     ) -> ResolvedChapterBundle:
         # 1. 获取候选漫画（支持显式 ID 直达或关键词检索）
         if cmd.explicit_manga_id and cmd.forced_source == source.source_id:
@@ -158,16 +173,18 @@ class MangaForwardOrchestrator:
                 )
                 raise MangaNotFoundError(f"未找到匹配的漫画「{cmd.manga_query}」{top_hint}")
 
-        # 尝试匹配度最高的前 2 个候选（防止源站存在同名空壳词条与连载正篇词条并存）
+        # 若用户指定了第X部/章（如 "第二章 13话"），兼容“同词条分部”与“独立第二部词条”两种源站收录方式
+        max_try = 3 if target.part_number is not None else 2
+        score_gap_limit = 0.18 if target.part_number is not None else 0.12
+
         last_err: Exception | None = None
-        for cand in candidates[:2]:
+        for idx_c, cand in enumerate(candidates[:max_try]):
             try:
                 chapters = await source.fetch_chapters(cand)
                 matched_chapter = select_matching_chapter(chapters, target, manga_title=cand.title)
                 page_specs = await source.fetch_chapter_pages(cand, matched_chapter)
 
                 dest_dir = temp_scope.subdir(source.source_id.value)
-                # 并发下载图片 + 并发拉取单话评论/章末吐槽（仅再漫画与拷贝漫画）
                 want_comments = cfg.comments.enable_comments and source.source_id.supports_comments
 
                 async def _safe_fetch_comments(
@@ -202,22 +219,54 @@ class MangaForwardOrchestrator:
                     _safe_fetch_comments(),
                 )
 
+                # 将章末吐槽调用远程 HTML 渲染服务按 20 条/页渲染为图片
+                comment_image_paths: list[Path] = []
+                if comments:
+                    try:
+                        comments_dir = temp_scope.subdir(f"{source.source_id.value}_comments")
+                        comment_image_paths = await self._comment_renderer.render_comment_pages(
+                            source=source.source_id,
+                            manga=cand,
+                            chapter=matched_chapter,
+                            comments=comments,
+                            comments_cfg=cfg.comments,
+                            dest_dir=comments_dir,
+                            umo=umo,
+                        )
+                    except Exception as r_exc:
+                        logger.warning(
+                            f"[{source.source_id.display_name}] 远程渲染章末吐槽图片失败 "
+                            f"({cand.title} {matched_chapter.title}): {r_exc}"
+                        )
+                        comment_image_paths = []
+                        if not cfg.comments.fallback_to_text:
+                            comments = []
+
                 return ResolvedChapterBundle(
                     source=source.source_id,
                     manga=cand,
                     chapter=matched_chapter,
                     downloaded_pages=downloaded_pages,
                     comments=comments,
+                    comment_image_paths=comment_image_paths,
                 )
             except ChapterNotFoundError as exc:
                 last_err = exc
-                # 若第 2 个候选标题匹配分显著低于第 1 个，不再盲目尝试无关衍生作
-                if len(candidates) < 2 or (cand.match_score - candidates[1].match_score) > 0.12:
+                next_idx = idx_c + 1
+                if (
+                    next_idx >= len(candidates[:max_try])
+                    or (cand.match_score - candidates[next_idx].match_score) > score_gap_limit
+                ):
                     break
             except Exception as exc:
                 last_err = exc
                 await temp_scope.clear_subdir(source.source_id.value)
-                if len(candidates) < 2 or (cand.match_score - candidates[1].match_score) > 0.12:
+                await temp_scope.clear_subdir(f"{source.source_id.value}_comments")
+                next_idx = idx_c + 1
+                if (
+                    next_idx >= len(candidates[:max_try])
+                    or (cand.match_score - candidates[next_idx].match_score) > score_gap_limit
+                ):
                     break
 
         assert last_err is not None

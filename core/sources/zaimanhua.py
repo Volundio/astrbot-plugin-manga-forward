@@ -16,7 +16,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..auth_manager import AuthManager
-from ..chapter_matcher import classify_chapter_meta
+from ..chapter_matcher import analyze_chapter_meta
 from ..config import ZaimanhuaConfig
 from ..http_client import AsyncHttpClient
 from ..models import (
@@ -134,7 +134,7 @@ class ZaimanhuaSource(BaseMangaSource):
                 ctitle = str(item.get("chapter_title") or "").strip()
                 if not cid or not ctitle:
                     continue
-                kind, num = classify_chapter_meta(ctitle, group_title)
+                meta = analyze_chapter_meta(ctitle, group_title)
                 upd = int(item.get("updatetime") or 0)
                 order_val = int(item.get("chapter_order") or seq)
                 seq += 1
@@ -142,8 +142,11 @@ class ZaimanhuaSource(BaseMangaSource):
                     ChapterInfo(
                         chapter_id=cid,
                         title=ctitle,
-                        number=num,
-                        kind=kind,
+                        number=meta.number,
+                        part_number=meta.part_number,
+                        sub_order=meta.sub_order,
+                        is_trial=meta.is_trial,
+                        kind=meta.kind,
                         group_name=group_title,
                         order_index=order_val,
                         updated_at=upd,

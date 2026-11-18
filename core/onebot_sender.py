@@ -238,18 +238,42 @@ def build_forward_node_batches(
                     )
                 )
 
-        # 在最后一个批次的最末尾附上单话评论 / 章末吐槽（仅再漫画与拷贝漫画源）
+        # 在最后一个批次的最末尾附上单话评论 / 章末吐槽（优先发送 20 条/页的远程渲染图片节点）
         is_last_batch = b_idx == total_batches
-        if is_last_batch and bundle.source.supports_comments and bundle.comments:
-            comments_text = format_comments_text(bundle.comments, src_name)
-            if comments_text:
-                nodes.append(
-                    Comp.Node(
-                        uin=bot_uin,
-                        name=f"{src_name} · 章末吐槽",
-                        content=[Comp.Plain(comments_text)],
+        if is_last_batch and bundle.source.supports_comments:
+            valid_comment_imgs = [
+                p for p in bundle.comment_image_paths if p is not None and p.exists()
+            ]
+            if valid_comment_imgs:
+                total_c_imgs = len(valid_comment_imgs)
+                for c_idx, c_path in enumerate(valid_comment_imgs, start=1):
+                    c_img_comp = (
+                        Comp.Image.fromFileSystem(str(c_path))
+                        if hasattr(Comp.Image, "fromFileSystem")
+                        else Comp.Image(file=str(c_path))
                     )
-                )
+                    c_node_name = (
+                        f"{src_name} · 章末吐槽 ({c_idx}/{total_c_imgs})"
+                        if total_c_imgs > 1
+                        else f"{src_name} · 章末吐槽"
+                    )
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=c_node_name,
+                            content=[c_img_comp],
+                        )
+                    )
+            elif bundle.comments:
+                comments_text = format_comments_text(bundle.comments, src_name)
+                if comments_text:
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=f"{src_name} · 章末吐槽",
+                            content=[Comp.Plain(comments_text)],
+                        )
+                    )
 
         if nodes:
             node_batches.append(nodes)

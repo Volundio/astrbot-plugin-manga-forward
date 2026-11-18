@@ -81,6 +81,8 @@ class ChapterTarget:
 
     mode: TargetMode
     number: float | None = None
+    part_number: int | None = None
+    sub_order: int | None = None
     raw_text: str = ""
     normalized_text: str = ""
 
@@ -108,6 +110,9 @@ class ChapterInfo:
     chapter_id: str
     title: str
     number: float | None = None
+    part_number: int | None = None
+    sub_order: int = 0
+    is_trial: bool = False
     kind: ChapterKind = ChapterKind.CHAPTER
     group_name: str = ""
     order_index: int = 0
@@ -148,13 +153,14 @@ class DownloadedPage:
 
 @dataclass(slots=True)
 class ResolvedChapterBundle:
-    """完成源解析、图片落盘与评论拉取后的整话投递数据包。"""
+    """完成源解析、图片落盘与评论拉取渲染后的整话投递数据包。"""
 
     source: SourceId
     manga: MangaCandidate
     chapter: ChapterInfo
     downloaded_pages: list[DownloadedPage]
     comments: list[ChapterComment] = field(default_factory=list)
+    comment_image_paths: list[Path] = field(default_factory=list)
 
 
 class MangaForwardError(Exception):

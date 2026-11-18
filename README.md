@@ -15,7 +15,7 @@
   - 有界并发预下载（自动携带各源防盗链 `Referer` / `Cookie` / `Authorization`），按固定页码槽位归并，**一张图片独占一条合并转发节点消息**；
   - 完整还原拷贝漫画 `/chapter2/` 接口 `words` 打乱页序映射，支持 Web 端 AES-128-CBC 解密双栈容灾；
   - 超多页或大体积章节自动按序分批合并转发，发送完成后立即清理本地临时文件，零磁盘残留。
-- **单话评论 / 章末吐槽**：当推送源为**再漫画**或**拷贝漫画**时，支持在整话合并转发末尾自动附上该话的热门单话评论 / 章末吐槽。
+- **单话评论 / 章末吐槽图片渲染**：当推送源为**再漫画**或**拷贝漫画**时，调用 **AstrBot 远程 HTML 渲染服务（`remote` / `astrbot-t2i-service`，默认复用本机已配置的 `remote` 渲染服务，也可在设置中自定义渲染端点与主题）** 按 **20 条一页**渲染为漫纸风格吐槽图片，追加在整话合并转发末尾。
 - **智能指令与简繁互通**：内置简繁双向归一化、中文数字（如 `第一百二十话`）、小数话（`12.5话`）、含空格漫画名、单行本卷/连载话隔离与 `最新话` 快捷定位。
 
 ---
@@ -77,9 +77,13 @@ git clone https://github.com/Volundio/astrbot-plugin-manga-forward
   - `enabled`、`api_domain`、`web_domain`、`image_resolution`（`800` / `1200` / `1500`）、可选 `token`。
 - **`komiic`（Komiic 配置）**：
   - `enabled`、`base_url`、`username`（邮箱） / `password`、`cookie`、`prefer_cookie`。
-- **`comments`（单话评论 / 章末吐槽）**：
+- **`comments`（单话评论 / 章末吐槽与远程渲染）**：
   - `enable_comments`：推送再漫画或拷贝漫画源时是否在末尾附上章末吐槽（默认开启）。
-  - `max_comments`：最多附带的吐槽条数（默认 `20`）。
+  - `comments_per_page`：每页章末吐槽图片包含的条数（默认 `20` 条一页）。
+  - `max_comments`：最多拉取并渲染的吐槽总条数（默认 `60`）。
+  - `t2i_endpoint`：自定义远程 HTML 渲染服务（`astrbot-t2i-service`）地址，留空默认使用本机 AstrBot 已配置好的 `remote` 渲染服务。
+  - `theme`：吐槽卡片视觉主题（`paper` 漫纸暖白 / `light` 现代纯白 / `dark` 夜间深色）。
+  - `fallback_to_text`：远程渲染不可用时是否自动回退为纯文本节点。
 - **`delivery` & `network`**：合并转发首条概览开关、单批最大页数与体积上限、解析等待提示与自动撤回、HTTP 代理及并发连接数。
 
 ---

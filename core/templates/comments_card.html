@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width={{ viewport_width }}, initial-scale=1.0" />
+  <meta id="astrbot-t2i-shiki-runtime" name="generator" content="astrbot-plugin-manga-forward" />
+  <style>
+    :root,
+    body[data-theme="paper"] {
+      --bg-outer: #f2ede4;
+      --bg-card: #fffdf8;
+      --bg-header: #f8f4eb;
+      --bg-row-alt: #faf7f0;
+      --border-frame: #1c1917;
+      --border-soft: #e5dfd3;
+      --border-dash: #d6cfc2;
+      --text-primary: #1c1917;
+      --text-secondary: #57534e;
+      --text-muted: #8a8379;
+      --accent: #c2410c;
+      --accent-bg: #ffedd5;
+      --accent-border: #fdba74;
+      --stamp-bg: #1c1917;
+      --stamp-fg: #fffdf8;
+      --rank-bg: #ede8dd;
+      --rank-fg: #44403c;
+      --rank-top-bg: #c2410c;
+      --rank-top-fg: #ffffff;
+      --author-fg: #7c2d12;
+      --author-bg: #fef3c7;
+      --dot-color: rgba(28, 25, 23, 0.06);
+      --shadow-card: 0 8px 24px rgba(28, 25, 23, 0.08);
+    }
+
+    body[data-theme="light"] {
+      --bg-outer: #f1f5f9;
+      --bg-card: #ffffff;
+      --bg-header: #f8fafc;
+      --bg-row-alt: #f8fafc;
+      --border-frame: #0f172a;
+      --border-soft: #e2e8f0;
+      --border-dash: #cbd5e1;
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #94a3b8;
+      --accent: #2563eb;
+      --accent-bg: #dbeafe;
+      --accent-border: #93c5fd;
+      --stamp-bg: #0f172a;
+      --stamp-fg: #ffffff;
+      --rank-bg: #f1f5f9;
+      --rank-fg: #475569;
+      --rank-top-bg: #2563eb;
+      --rank-top-fg: #ffffff;
+      --author-fg: #1e40af;
+      --author-bg: #eff6ff;
+      --dot-color: rgba(15, 23, 42, 0.05);
+      --shadow-card: 0 8px 24px rgba(15, 23, 42, 0.07);
+    }
+
+    body[data-theme="dark"] {
+      --bg-outer: #0b1120;
+      --bg-card: #131c2e;
+      --bg-header: #18243a;
+      --bg-row-alt: #162136;
+      --border-frame: #38bdf8;
+      --border-soft: #24324b;
+      --border-dash: #2e3f5c;
+      --text-primary: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent: #fb923c;
+      --accent-bg: rgba(251, 146, 60, 0.16);
+      --accent-border: rgba(251, 146, 60, 0.38);
+      --stamp-bg: #38bdf8;
+      --stamp-fg: #0b1120;
+      --rank-bg: #1e293b;
+      --rank-fg: #94a3b8;
+      --rank-top-bg: #ea580c;
+      --rank-top-fg: #ffffff;
+      --author-fg: #7dd3fc;
+      --author-bg: rgba(56, 189, 248, 0.14);
+      --dot-color: rgba(148, 163, 184, 0.06);
+      --shadow-card: 0 10px 28px rgba(0, 0, 0, 0.4);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: {{ viewport_width }}px;
+      background-color: var(--bg-outer);
+      color: var(--text-primary);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "WenQuanYi Micro Hei", -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .page-wrap {
+      padding: 20px;
+      width: 100%;
+    }
+
+    .sheet {
+      background: var(--bg-card);
+      border: 2px solid var(--border-frame);
+      border-radius: 10px;
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+
+    .header {
+      position: relative;
+      padding: 20px 24px 18px;
+      background-color: var(--bg-header);
+      background-image: radial-gradient(var(--dot-color) 1.2px, transparent 1.2px);
+      background-size: 10px 10px;
+      border-bottom: 2px solid var(--border-frame);
+    }
+
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .header-badges {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .stamp-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--stamp-bg);
+      color: var(--stamp-fg);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      border-radius: 4px;
+    }
+
+    .source-pill {
+      display: inline-block;
+      padding: 3px 9px;
+      border: 1px solid var(--accent-border);
+      background: var(--accent-bg);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      border-radius: 4px;
+    }
+
+    .page-pill {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-secondary);
+      padding: 3px 10px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-soft);
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+
+    .manga-heading {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 800;
+      line-height: 1.38;
+      color: var(--text-primary);
+      word-break: break-word;
+    }
+
+    .chapter-sub {
+      display: inline-block;
+      margin-left: 6px;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .comment-list {
+      padding: 6px 22px 10px;
+    }
+
+    .comment-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 13px;
+      padding: 13px 6px;
+      border-bottom: 1px dashed var(--border-dash);
+    }
+
+    .comment-item:last-child {
+      border-bottom: none;
+    }
+
+    .rank-num {
+      flex-shrink: 0;
+      min-width: 28px;
+      height: 24px;
+      padding: 0 6px;
+      margin-top: 1px;
+      border-radius: 6px;
+      background: var(--rank-bg);
+      color: var(--rank-fg);
+      font-size: 12px;
+      font-weight: 800;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .rank-num.is-top {
+      background: var(--rank-top-bg);
+      color: var(--rank-top-fg);
+    }
+
+    .comment-main {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .comment-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+
+    .author-tag {
+      display: inline-block;
+      max-width: 420px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 1px 8px;
+      border-radius: 4px;
+      background: var(--author-bg);
+      color: var(--author-fg);
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+
+    .comment-body-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .comment-text {
+      flex: 1;
+      font-size: 16px;
+      line-height: 1.58;
+      color: var(--text-primary);
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    .likes-badge {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--rank-bg);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 1px;
+    }
+
+    .likes-badge.is-hot {
+      background: var(--accent-bg);
+      color: var(--accent);
+      border: 1px solid var(--accent-border);
+    }
+
+    .likes-icon {
+      width: 12px;
+      height: 12px;
+      fill: currentColor;
+    }
+
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 24px;
+      background: var(--bg-header);
+      border-top: 1px solid var(--border-soft);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body data-theme="{{ theme | e }}">
+  <div class="page-wrap">
+    <div class="sheet">
+      <div class="header">
+        <div class="header-top">
+          <div class="header-badges">
+            <span class="stamp-badge">章末吐槽</span>
+            <span class="source-pill">{{ source_name | e }}</span>
+          </div>
+          <span class="page-pill">第 {{ page_no }} / {{ total_pages }} 页 · 共 {{ total_comments }} 条</span>
+        </div>
+        <h1 class="manga-heading">
+          《{{ manga_title | e }}》<span class="chapter-sub">{{ chapter_title | e }}</span>
+        </h1>
+      </div>
+
+      <div class="comment-list">
+        {% for item in items %}
+        <div class="comment-item">
+          <span class="rank-num{% if item.rank <= 3 %} is-top{% endif %}">{{ item.rank_label }}</span>
+          <div class="comment-main">
+            {% if item.author %}
+            <div class="comment-meta">
+              <span class="author-tag">@{{ item.author | e }}</span>
+              {% if item.likes > 0 %}
+              <span class="likes-badge{% if item.likes >= 15 %} is-hot{% endif %}">
+                <svg class="likes-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                </svg>
+                {{ item.likes }}
+              </span>
+              {% endif %}
+            </div>
+            <div class="comment-text">{{ item.content | e }}</div>
+            {% else %}
+            <div class="comment-body-row">
+              <div class="comment-text">{{ item.content | e }}</div>
+              {% if item.likes > 0 %}
+              <span class="likes-badge{% if item.likes >= 15 %} is-hot{% endif %}">
+                <svg class="likes-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                </svg>
+                {{ item.likes }}
+              </span>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="footer">
+        <span>{{ source_name | e }} · 单话评论 / 章末吐槽</span>
+        <span>PAGE {{ page_no }} OF {{ total_pages }} ({{ range_start }}–{{ range_end }})</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

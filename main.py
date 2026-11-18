@@ -68,6 +68,7 @@ class MangaForwardPlugin(Star):
         self._orchestrator = MangaForwardOrchestrator(
             self._data_dir,
             lambda: self.config,
+            context=self.context,
         )
         self._gc_task: asyncio.Task[None] | None = None
         self._terminated = False
@@ -145,8 +146,13 @@ class MangaForwardPlugin(Star):
             wait_msg_id = await send_wait_tip(event, tip_text)
 
         temp_scope = self._temp_mgr.create_scope()
+        umo = getattr(event, "unified_msg_origin", None)
         try:
-            bundle = await self._orchestrator.resolve_and_download(parsed_cmd, temp_scope)
+            bundle = await self._orchestrator.resolve_and_download(
+                parsed_cmd,
+                temp_scope,
+                umo=str(umo) if umo else None,
+            )
             await send_chapter_forward_batches(event, bundle, cfg.delivery)
         except MangaForwardError as exc:
             safe_msg = redact_secrets(str(exc), secrets)

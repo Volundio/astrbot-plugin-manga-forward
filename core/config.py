@@ -64,7 +64,11 @@ class KomiicConfig:
 @dataclass(slots=True)
 class CommentsConfig:
     enable_comments: bool = True
-    max_comments: int = 20
+    comments_per_page: int = 20
+    max_comments: int = 60
+    t2i_endpoint: str = ""
+    theme: str = "paper"
+    fallback_to_text: bool = True
 
 
 @dataclass(slots=True)
@@ -190,9 +194,16 @@ class PluginConfig:
         )
 
         cmt_raw = _as_dict(cfg.get("comments"))
+        theme_val = str(cmt_raw.get("theme") or "paper").strip().lower()
+        if theme_val not in ("paper", "light", "dark"):
+            theme_val = "paper"
         cmt_cfg = CommentsConfig(
             enable_comments=bool(cmt_raw.get("enable_comments", True)),
-            max_comments=_clamp_int(cmt_raw.get("max_comments"), 20, 1, 100),
+            comments_per_page=_clamp_int(cmt_raw.get("comments_per_page"), 20, 5, 50),
+            max_comments=_clamp_int(cmt_raw.get("max_comments"), 60, 5, 200),
+            t2i_endpoint=str(cmt_raw.get("t2i_endpoint") or "").strip(),
+            theme=theme_val,
+            fallback_to_text=bool(cmt_raw.get("fallback_to_text", True)),
         )
 
         dlv_raw = _as_dict(cfg.get("delivery"))

@@ -174,23 +174,60 @@
   },
   "comments": {
     "type": "object",
-    "description": "单话评论 / 章末吐槽设置",
+    "description": "单话评论 / 章末吐槽与远程渲染设置",
     "items": {
       "enable_comments": {
         "type": "bool",
         "description": "推送再漫画或拷贝漫画时附上单话评论/章末吐槽",
-        "hint": "开启后，在整话所有漫画图片节点的最后自动追加该话的热门评论/章末吐槽消息节点。",
+        "hint": "开启后，在整话所有漫画图片节点的最后自动调用远程 HTML 渲染服务将章末吐槽渲染为图片（每页 20 条）附加发送。",
         "default": true
       },
-      "max_comments": {
+      "comments_per_page": {
         "type": "int",
-        "description": "章末最多展示的评论/吐槽条数",
+        "description": "章末吐槽每页渲染条数",
+        "hint": "默认 20 条吐槽渲染为一页图片；超过单页条数时自动分页生成多张吐槽图片依次追加在末尾。",
         "default": 20,
         "slider": {
           "min": 5,
           "max": 50,
           "step": 5
         }
+      },
+      "max_comments": {
+        "type": "int",
+        "description": "章末最多拉取并渲染的吐槽总条数",
+        "default": 60,
+        "slider": {
+          "min": 20,
+          "max": 120,
+          "step": 20
+        }
+      },
+      "t2i_endpoint": {
+        "type": "string",
+        "description": "远程 HTML 渲染服务 (T2I) 地址",
+        "hint": "留空则默认使用本机 AstrBot 已配置好的远程 HTML 渲染服务 (remote)；也可单独填写自建 astrbot-t2i-service 地址（例如 http://127.0.0.1:8999 或 http://127.0.0.1:8999/text2img）。",
+        "default": ""
+      },
+      "theme": {
+        "type": "string",
+        "description": "章末吐槽渲染卡片视觉主题",
+        "default": "paper",
+        "options": [
+          "paper",
+          "light",
+          "dark"
+        ],
+        "labels": [
+          "漫纸暖白（默认推荐）",
+          "现代极简纯白",
+          "夜间护眼深色"
+        ]
+      },
+      "fallback_to_text": {
+        "type": "bool",
+        "description": "远程图片渲染失败时自动回退为纯文本发送",
+        "default": true
       }
     }
   },
