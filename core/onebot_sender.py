@@ -180,8 +180,8 @@ def build_forward_node_batches(
     - 再漫画或拷贝漫画存在单话评论/章末吐槽时，追加在最后一个批次的最末尾。
     """
     total_pages = len(bundle.downloaded_pages)
-    max_pages = max(10, delivery_cfg.max_pages_per_forward)
-    max_bytes = max(5, delivery_cfg.max_mb_per_forward) * 1024 * 1024
+    max_pages = max(1, delivery_cfg.max_pages_per_forward)
+    max_bytes = max(1, delivery_cfg.max_mb_per_forward) * 1024 * 1024
 
     page_batches = _split_pages_into_batches(
         bundle.downloaded_pages,
@@ -305,8 +305,8 @@ async def send_chapter_forward_batches(
     """逐批构建、发送合并转发并立即释放已发批次图片与内存，杜绝多批次 Base64 叠加内存溢出。"""
     bot_uin = resolve_bot_uin(event)
     total_pages = len(bundle.downloaded_pages)
-    max_pages = max(10, delivery_cfg.max_pages_per_forward)
-    max_bytes = max(5, delivery_cfg.max_mb_per_forward) * 1024 * 1024
+    max_pages = max(1, delivery_cfg.max_pages_per_forward)
+    max_bytes = max(1, delivery_cfg.max_mb_per_forward) * 1024 * 1024
 
     page_batches = _split_pages_into_batches(
         bundle.downloaded_pages,

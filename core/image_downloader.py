@@ -25,7 +25,7 @@ from .models import (
 )
 from .sources.base import BaseMangaSource
 
-MAX_SINGLE_IMAGE_BYTES = 18 * 1024 * 1024
+DEFAULT_MAX_SINGLE_IMAGE_BYTES = 18 * 1024 * 1024
 DEFAULT_MAX_CHAPTER_BYTES = 150 * 1024 * 1024
 MAX_TOTAL_TEMP_DIR_BYTES = 320 * 1024 * 1024
 
@@ -232,7 +232,8 @@ class ChapterImageDownloader:
         chapter: ChapterInfo,
         specs: list[PageSpec],
         dest_dir: Path,
-        concurrency: int = 5,
+        concurrency: int = 6,
+        max_single_image_bytes: int = DEFAULT_MAX_SINGLE_IMAGE_BYTES,
         max_chapter_bytes: int = DEFAULT_MAX_CHAPTER_BYTES,
     ) -> list[DownloadedPage]:
         if not specs:
@@ -242,8 +243,10 @@ class ChapterImageDownloader:
         ordered_specs = sorted(specs, key=lambda s: s.index)
         total_pages = len(ordered_specs)
         slots: list[DownloadedPage | None] = [None] * total_pages
+        single_cap = max(64 * 1024, max_single_image_bytes)
+        chapter_cap = max(single_cap, max_chapter_bytes)
 
-        sem = asyncio.Semaphore(max(1, min(16, concurrency)))
+        sem = asyncio.Semaphore(max(1, min(32, concurrency)))
         refresh_lock = asyncio.Lock()
         refreshed_once = False
         total_bytes = 0
@@ -265,12 +268,12 @@ class ChapterImageDownloader:
                 for attempt in range(3):
                     if abort_exc is not None:
                         return
-                    remaining_budget = max_chapter_bytes - total_bytes
+                    remaining_budget = chapter_cap - total_bytes
                     if remaining_budget <= 0:
                         last_err = "超出单话累计体积安全上限"
                         break
 
-                    per_file_cap = min(MAX_SINGLE_IMAGE_BYTES, remaining_budget)
+                    per_file_cap = min(single_cap, remaining_budget)
                     try:
                         st_res = await _stream_or_fallback_get(
                             self._http,

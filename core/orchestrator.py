@@ -276,6 +276,7 @@ class MangaForwardOrchestrator:
                         )
                         return []
 
+                max_single_img_bytes = cfg.network.max_single_image_mb * 1024 * 1024
                 downloaded_pages, comments = await asyncio.gather(
                     self._downloader.download_chapter_pages(
                         source=source,
@@ -284,6 +285,7 @@ class MangaForwardOrchestrator:
                         specs=page_specs,
                         dest_dir=dest_dir,
                         concurrency=cfg.network.download_concurrency,
+                        max_single_image_bytes=max_single_img_bytes,
                         max_chapter_bytes=cfg.network.max_chapter_mb * 1024 * 1024,
                     ),
                     _safe_fetch_comments(),
@@ -302,6 +304,7 @@ class MangaForwardOrchestrator:
                             comments_cfg=cfg.comments,
                             dest_dir=comments_dir,
                             umo=umo,
+                            max_image_bytes=max_single_img_bytes,
                         )
                     except Exception as r_exc:
                         logger.warning(

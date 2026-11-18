@@ -652,3 +652,24 @@ async def test_streaming_download_and_incremental_batch_file_cleanup(
     # 全部批次发完后，所有正文图片与吐槽渲染图均已被即时回收
     assert all(p.local_path is not None and not p.local_path.exists() for p in pages)
     assert not cmt_img.exists()
+
+
+def test_restored_batch_defaults_and_adjustable_image_limits() -> None:
+    """验证单批默认上限已还原为 60 页 / 28MB，且单图、整话与分批上限均可通过设置自由调整。"""
+    default_cfg = PluginConfig.from_mapping(None)
+    assert default_cfg.delivery.max_pages_per_forward == 60
+    assert default_cfg.delivery.max_mb_per_forward == 28
+    assert default_cfg.network.download_concurrency == 6
+    assert default_cfg.network.max_single_image_mb == 18
+    assert default_cfg.network.max_chapter_mb == 150
+
+    custom_cfg = PluginConfig.from_mapping(
+        {
+            "delivery": {"max_pages_per_forward": 120, "max_mb_per_forward": 80},
+            "network": {"max_single_image_mb": 40, "max_chapter_mb": 600},
+        }
+    )
+    assert custom_cfg.delivery.max_pages_per_forward == 120
+    assert custom_cfg.delivery.max_mb_per_forward == 80
+    assert custom_cfg.network.max_single_image_mb == 40
+    assert custom_cfg.network.max_chapter_mb == 600

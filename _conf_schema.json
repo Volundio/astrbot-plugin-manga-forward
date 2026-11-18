@@ -244,24 +244,14 @@
       "max_pages_per_forward": {
         "type": "int",
         "description": "单条合并转发最大页数",
-        "hint": "单话页数超过此上限时自动按序分批合并转发，且每发送完一批立即释放对应图片与内存。",
-        "default": 50,
-        "slider": {
-          "min": 20,
-          "max": 100,
-          "step": 5
-        }
+        "hint": "单话页数超过此上限时自动按序分批合并转发（每发完一批立即释放对应图片与内存），可在设置中自由调整。",
+        "default": 60
       },
       "max_mb_per_forward": {
         "type": "int",
         "description": "单条合并转发最大图片总体积 (MB)",
-        "hint": "超过此体积时自动切分下一批合并转发，防止单次 Base64 编码占用过高内存或 WebSocket 帧溢出。",
-        "default": 20,
-        "slider": {
-          "min": 8,
-          "max": 50,
-          "step": 2
-        }
+        "hint": "单批图片累计超过此体积时自动切分下一批合并转发，可在设置中自由调整。",
+        "default": 28
       },
       "send_wait_tip": {
         "type": "bool",
@@ -298,7 +288,7 @@
       "download_concurrency": {
         "type": "int",
         "description": "单话图片流式并发下载数",
-        "default": 5,
+        "default": 6,
         "slider": {
           "min": 1,
           "max": 12,
@@ -326,16 +316,17 @@
           "step": 1
         }
       },
+      "max_single_image_mb": {
+        "type": "int",
+        "description": "单张图片体积上限 (MB)",
+        "hint": "单张漫画正文图片或单页章末吐槽渲染图的最大允许体积，超出则在流式下载中熔断并清理半截文件，可在设置中自由调整。",
+        "default": 18
+      },
       "max_chapter_mb": {
         "type": "int",
         "description": "单话图片下载总体积上限 (MB)",
-        "hint": "限制单次任务临时落盘的最大累计字节数，防止超长全彩合集撑满磁盘与内存。",
-        "default": 150,
-        "slider": {
-          "min": 30,
-          "max": 300,
-          "step": 10
-        }
+        "hint": "单次任务整话图片的累计落盘体积上限，防止异常超长合集撑爆磁盘或内存，可在设置中自由调整。",
+        "default": 150
       },
       "index_idle_unload_min": {
         "type": "int",

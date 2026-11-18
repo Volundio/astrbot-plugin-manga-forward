@@ -20,7 +20,7 @@ TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "comments_card.h
 ASTRBOT_T2I_ENDPOINTS_DISCOVERY_URL = "https://api.soulter.top/astrbot/t2i-endpoints"
 DEFAULT_ASTRBOT_T2I_ENDPOINT = "https://t2i.soulter.top/text2img"
 COMMENT_CARD_VIEWPORT_WIDTH = 720
-MAX_RENDERED_COMMENT_IMAGE_BYTES = 12 * 1024 * 1024
+DEFAULT_MAX_RENDERED_COMMENT_IMAGE_BYTES = 18 * 1024 * 1024
 
 
 def load_comments_template() -> str:
@@ -122,6 +122,7 @@ class CommentCardRenderer:
         comments_cfg: CommentsConfig,
         dest_dir: Path,
         umo: str | None = None,
+        max_image_bytes: int = DEFAULT_MAX_RENDERED_COMMENT_IMAGE_BYTES,
     ) -> list[Path]:
         """将单话评论/章末吐槽按每页 `comments_per_page` 条渲染为多张卡片图片。"""
         if not comments:
@@ -132,6 +133,7 @@ class CommentCardRenderer:
         total_pages = len(pages)
         total_comments = len(comments)
         dest_dir.mkdir(parents=True, exist_ok=True)
+        single_cap = max(64 * 1024, max_image_bytes)
 
         effective_endpoint = self.resolve_effective_endpoint(comments_cfg.t2i_endpoint, umo=umo)
         screenshot_options: dict[str, Any] = {
@@ -178,6 +180,7 @@ class CommentCardRenderer:
                 effective_endpoint=effective_endpoint,
                 dest_dir=dest_dir,
                 page_idx=page_idx,
+                max_image_bytes=single_cap,
             )
             rendered_paths.append(out_file)
 
@@ -191,6 +194,7 @@ class CommentCardRenderer:
         effective_endpoint: str | None,
         dest_dir: Path,
         page_idx: int,
+        max_image_bytes: int,
     ) -> Path:
         html_renderer = (
             getattr(self._context, "html_renderer", None) if self._context is not None else None
@@ -215,6 +219,8 @@ class CommentCardRenderer:
                 raw_path = Path(str(raw_path_str))
                 try:
                     if raw_path.exists():
+                        if raw_path.stat().st_size > max_image_bytes:
+                            raise RuntimeError("章末吐槽渲染图片超出单张图片体积上限")
                         head = await asyncio.to_thread(_read_head_sync, raw_path, 32)
                         ext = detect_image_extension(head) or ".jpg"
                         target_path = dest_dir / f"comments_{page_idx:02d}{ext}"
@@ -244,7 +250,7 @@ class CommentCardRenderer:
                 raw_dest,
                 json_body=post_payload,
                 timeout_sec=35.0,
-                max_bytes=MAX_RENDERED_COMMENT_IMAGE_BYTES,
+                max_bytes=max_image_bytes,
             )
             if st_res.status != 200:
                 raw_dest.unlink(missing_ok=True)
@@ -268,7 +274,7 @@ class CommentCardRenderer:
         if resp.status != 200:
             preview = resp.text()[:200]
             raise RuntimeError(f"远程 HTML 渲染服务 ({gen_url}) 返回 HTTP {resp.status}: {preview}")
-        if len(resp.body) > MAX_RENDERED_COMMENT_IMAGE_BYTES:
+        if len(resp.body) > max_image_bytes:
             raise RuntimeError("章末吐槽渲染图片体积超限")
         ext = detect_image_extension(resp.body)
         if ext is None:
