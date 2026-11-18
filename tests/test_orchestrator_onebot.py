@@ -473,6 +473,8 @@ def test_metadata_and_conf_schema_integrity() -> None:
 
     assert meta["name"] == "astrbot_plugin_manga_forward"
     assert meta["support_platforms"] == ["aiocqhttp"]
+    logo_file = root / "logo.png"
+    assert logo_file.exists() and logo_file.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
     # 校验所有顶层与二级配置项均包含合法的 type、description、default，且敏感凭据均标注 secret=True
     for key, spec in schema.items():

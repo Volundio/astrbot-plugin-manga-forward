@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./logo.png" width="128" height="128" alt="astrbot-plugin-manga-forward logo" />
+</p>
+
 # astrbot-plugin-manga-forward（漫画整话转发）
 
 一款严格遵循 [AstrBot 插件开发规范](https://docs.astrbot.app/dev/star/plugin-new.html) 的漫画整话跨源解析与合并转发插件。通过 `manga` 指令即可按自定义优先级从 **再漫画**、**拷贝漫画**、**Komiic** 检索并下载整话高清图片，经 **OneBot v11 (`aiocqhttp`)** 合并转发（**一张图片一条消息，严格保证漫画页码顺序**）发送给用户，并支持在最后附上单话评论 / 章末吐槽。
