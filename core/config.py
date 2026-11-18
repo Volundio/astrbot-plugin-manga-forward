@@ -76,6 +76,7 @@ class DeliveryConfig:
     include_header_node: bool = True
     max_pages_per_forward: int = 60
     max_mb_per_forward: int = 28
+    max_batch_chapters: int = 10
     send_wait_tip: bool = True
     recall_wait_tip: bool = True
 
@@ -216,6 +217,7 @@ class PluginConfig:
             include_header_node=bool(dlv_raw.get("include_header_node", True)),
             max_pages_per_forward=_clamp_int(dlv_raw.get("max_pages_per_forward"), 60, 1, 1000),
             max_mb_per_forward=_clamp_int(dlv_raw.get("max_mb_per_forward"), 28, 1, 2048),
+            max_batch_chapters=_clamp_int(dlv_raw.get("max_batch_chapters"), 10, 1, 200),
             send_wait_tip=bool(dlv_raw.get("send_wait_tip", True)),
             recall_wait_tip=bool(dlv_raw.get("recall_wait_tip", True)),
         )

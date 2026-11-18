@@ -278,3 +278,95 @@ def test_kanokari_latest_chapter_ignores_birthday_extras_and_reuploaded_volumes(
 
     vol34 = select_matching_chapter(chapters, parse_chapter_target("34卷"), "女朋友、借我一下")
     assert vol34.title == "34卷"
+
+
+def test_batch_chapter_parsing_and_selection() -> None:
+    """全面验证批量多话语法：区间、含小数话、逗号/顿号列表、混合区间、第二部区间、最新N话与上限拦截。"""
+    from core.chapter_matcher import is_batch_chapter_spec, select_matching_chapters_batch
+
+    # 1. 指令参数拆分（含空格连接符、无空格粘连、多部前缀）
+    c_spaced = parse_manga_command("电锯人 1 - 5话")
+    assert c_spaced.manga_query == "电锯人" and c_spaced.chapter_spec == "1-5话"
+
+    c_part_rng = parse_manga_command("异剑战记 第二部 1 到 3话")
+    assert c_part_rng.manga_query == "异剑战记" and c_part_rng.chapter_spec == "第二部 1-3话"
+
+    c_glued = parse_manga_command("黑暗集会最新3话")
+    assert c_glued.manga_query == "黑暗集会" and c_glued.chapter_spec == "最新3话"
+
+    c_hyphen_title = parse_manga_command("86-不存在的战区- 1-3话")
+    assert (
+        c_hyphen_title.manga_query == "86-不存在的战区-" and c_hyphen_title.chapter_spec == "1-3话"
+    )
+
+    assert is_batch_chapter_spec("1-5") is True
+    assert is_batch_chapter_spec("1,3,5话") is True
+    assert is_batch_chapter_spec("最新3话") is True
+    assert is_batch_chapter_spec("最新话") is False
+    assert is_batch_chapter_spec("45-54话的附加彩色插画") is False
+
+    # 2. 构造含小数话 (2.5话)、多汉化组重复话、单行本卷、第二部章节的章节池
+    raw_defs = [
+        ("1卷", "单行本"),
+        ("2卷", "单行本"),
+        ("第1话", "连载"),
+        ("1话", "汉化版"),  # 多分组重复章节，应自动去重保留主连载组
+        ("第2话", "连载"),
+        ("第2.5话", "连载"),
+        ("第3话", "连载"),
+        ("第4话", "连载"),
+        ("第5话", "连载"),
+        ("45-54话的附加彩色插画", "默認"),
+        ("第二部 第1话", "连载"),
+        ("第二部 第2话", "连载"),
+    ]
+    pool: list[ChapterInfo] = []
+    for i, (t, grp) in enumerate(raw_defs):
+        m = analyze_chapter_meta(t, grp)
+        pool.append(
+            ChapterInfo(
+                chapter_id=f"b_{i}",
+                title=t,
+                number=m.number,
+                part_number=m.part_number,
+                sub_order=m.sub_order,
+                is_trial=m.is_trial,
+                kind=m.kind,
+                group_name=grp,
+                order_index=i,
+            )
+        )
+
+    # 区间 1-3话 自动包含 2.5话 且去重“汉化版 1话”
+    r_1_3 = select_matching_chapters_batch(pool, "第1话~第3话", manga_title="测试", max_chapters=10)
+    assert [c.title for c in r_1_3] == ["第1话", "第2话", "第2.5话", "第3话"]
+
+    # 离散 + 区间混合 `1, 4-5话`
+    r_mix = select_matching_chapters_batch(pool, "1、4-5话", manga_title="测试", max_chapters=10)
+    assert [c.title for c in r_mix] == ["第1话", "第4话", "第5话"]
+
+    # 第二部区间 `第二部 1-2话`
+    r_p2 = select_matching_chapters_batch(pool, "第二部 1-2话", manga_title="测试", max_chapters=10)
+    assert [c.title for c in r_p2] == ["第二部 第1话", "第二部 第2话"]
+
+    # 单行本卷区间 `1-2卷`
+    r_vol = select_matching_chapters_batch(pool, "1-2卷", manga_title="测试", max_chapters=10)
+    assert [c.title for c in r_vol] == ["1卷", "2卷"]
+
+    # 最新3话（按阅读正序返回最后 3 话：第5话、第二部 第1话、第二部 第2话）
+    r_lat3 = select_matching_chapters_batch(pool, "最新3话", manga_title="测试", max_chapters=10)
+    assert [c.title for c in r_lat3] == ["第5话", "第二部 第1话", "第二部 第2话"]
+
+    # 特殊标题含横杠仍按单章精确匹配
+    r_omake = select_matching_chapters_batch(
+        pool, "45-54话的附加彩色插画", manga_title="测试", max_chapters=10
+    )
+    assert [c.title for c in r_omake] == ["45-54话的附加彩色插画"]
+
+    # 超出 max_batch_chapters 立即抛出 CommandUsageError
+    with pytest.raises(CommandUsageError, match="max_batch_chapters"):
+        select_matching_chapters_batch(pool, "1-5话", manga_title="测试", max_chapters=3)
+
+    # 区间缺失端点（如请求 4-6话 但无 6话）抛出 ChapterNotFoundError 以便触发跨源回退
+    with pytest.raises(ChapterNotFoundError):
+        select_matching_chapters_batch(pool, "4-6话", manga_title="测试", max_chapters=10)

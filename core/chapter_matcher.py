@@ -14,7 +14,14 @@ import math
 import re
 from dataclasses import dataclass
 
-from .models import ChapterInfo, ChapterKind, ChapterNotFoundError, ChapterTarget, TargetMode
+from .models import (
+    ChapterInfo,
+    ChapterKind,
+    ChapterNotFoundError,
+    ChapterTarget,
+    CommandUsageError,
+    TargetMode,
+)
 from .text_utils import (
     extract_number_from_text,
     format_chapter_num,
@@ -542,3 +549,240 @@ def select_matching_chapter(
         f"未找到《{manga_title}》的「{target.raw_text}」{suffix}",
         latest_hint=latest_hint,
     )
+
+
+_LATEST_N_RE = re.compile(
+    rf"^(?:(?:最新|最近|最后)\s*({_NUM_PAT})\s*(?:话|回|章|集)?|latest\s*(\d+))$",
+    re.IGNORECASE,
+)
+_BATCH_SEG_ATOM_PAT = (
+    rf"(?:第\s*|ch\.?\s*|ep\.?\s*|vol\.?\s*|卷\s*)?({_NUM_PAT})\s*(?:话|回|章|集|卷|册|单行本)?"
+)
+_BATCH_RANGE_SEG_RE = re.compile(
+    rf"^\s*{_BATCH_SEG_ATOM_PAT}\s*(?:[-~～—–]|(?:\.\.)|至|到)\s*{_BATCH_SEG_ATOM_PAT}\s*$",
+    re.IGNORECASE,
+)
+_LIST_SEP_RE = re.compile(r"[,，、;；]+")
+
+
+def _strip_leading_part_for_batch(simp: str) -> tuple[int | None, str]:
+    m_part = _LEADING_PART_PREFIX_RE.match(simp)
+    if m_part:
+        rem = simp[m_part.end() :].strip()
+        if rem and extract_number_from_text(rem) is not None:
+            p_val = _parse_num_token(m_part.group(1))
+            if p_val is not None:
+                return int(p_val), rem
+    return None, simp
+
+
+def is_batch_chapter_spec(spec: str) -> bool:
+    """判断用户输入的话数描述是否为多话批量表达式（区间、逗号/顿号列表或最新N话）。"""
+    simp = to_simplified(spec or "").strip()
+    if not simp or simp.lower() in _LATEST_KEYWORDS:
+        return False
+    if _LATEST_N_RE.match(simp):
+        return True
+    _, body = _strip_leading_part_for_batch(simp)
+    if _LIST_SEP_RE.search(body):
+        return True
+    return bool(_BATCH_RANGE_SEG_RE.match(body))
+
+
+def _dedupe_numbered_pool(pool: list[ChapterInfo]) -> list[ChapterInfo]:
+    """按 `(part, number, sub_order)` 去重多汉化组重复章节，并自动合并/保留真实上下篇。"""
+    best_by_key: dict[tuple[int, float, int], ChapterInfo] = {}
+
+    def _cand_rank(c: ChapterInfo) -> tuple[int, int, int]:
+        _, _, c_trial = _effective_meta(c)
+        grp_rank = 0 if c.group_name in ("", "连载", "默认", "默認", "default", "chapter") else 1
+        return (1 if c_trial else 0, grp_rank, c.order_index)
+
+    for c in pool:
+        if c.number is None:
+            continue
+        c_part, c_sub, _ = _effective_meta(c)
+        key = (c_part or 1, round(c.number, 4), c_sub)
+        prev = best_by_key.get(key)
+        if prev is None or _cand_rank(c) < _cand_rank(prev):
+            best_by_key[key] = c
+
+    has_whole = {(p, n) for (p, n, sub) in best_by_key if sub == 0}
+    filtered = [
+        chap for (p, n, sub), chap in best_by_key.items() if sub == 0 or (p, n) not in has_whole
+    ]
+    filtered.sort(
+        key=lambda c: (
+            (_effective_meta(c)[0] or 1),
+            round(c.number or 0.0, 4),
+            _effective_meta(c)[1],
+            c.order_index,
+        )
+    )
+    return filtered
+
+
+def _expand_range_in_chapters(
+    chapters: list[ChapterInfo],
+    lo: float,
+    hi: float,
+    *,
+    is_vol: bool,
+    part_num: int | None,
+    manga_title: str,
+) -> list[ChapterInfo]:
+    if is_vol:
+        pool = [
+            c
+            for c in chapters
+            if (
+                c.kind == ChapterKind.VOLUME
+                or ("卷" in to_simplified(c.title) and c.kind != ChapterKind.SPECIAL)
+            )
+        ]
+    else:
+        pool = [c for c in chapters if c.kind == ChapterKind.CHAPTER]
+        if part_num is not None:
+            exact_part = [c for c in pool if _effective_meta(c)[0] == part_num]
+            has_any_part = any(_effective_meta(c)[0] is not None for c in chapters)
+            if exact_part:
+                pool = exact_part
+            elif has_any_part:
+                pool = []
+        else:
+            p1_pool = [c for c in pool if _effective_meta(c)[0] in (None, 1)]
+            if p1_pool:
+                pool = p1_pool
+
+    in_range = [c for c in pool if c.number is not None and (lo - 1e-4) <= c.number <= (hi + 1e-4)]
+    has_lo = any(_num_equals(c.number, lo) for c in in_range)
+    has_hi = any(_num_equals(c.number, hi) for c in in_range)
+    if not in_range or not has_lo or not has_hi:
+        unit = "卷" if is_vol else "话"
+        missing_num = lo if not has_lo else hi
+        latest_hint = _describe_latest(chapters)
+        suffix = f"（当前最新：{latest_hint}）" if latest_hint else ""
+        raise ChapterNotFoundError(
+            f"未找到《{manga_title}》区间内的第{format_chapter_num(missing_num)}{unit}{suffix}",
+            latest_hint=latest_hint,
+        )
+
+    return _dedupe_numbered_pool(in_range)
+
+
+def select_matching_chapters_batch(
+    chapters: list[ChapterInfo],
+    spec: str,
+    *,
+    manga_title: str = "",
+    max_chapters: int = 10,
+) -> list[ChapterInfo]:
+    """解析单话或批量话数表达式（如 `1-5话`、`1,3,5话`、`1,3-5话`、`最新3话`、`第二部 1-3话`），按阅读顺序返回目标章节列表。"""
+    raw = (spec or "").strip()
+    simp = to_simplified(raw).strip()
+    limit = max(1, int(max_chapters))
+
+    # 1. `最新N话 / 最近N话 / 最后N话`
+    m_latest_n = _LATEST_N_RE.match(simp)
+    if m_latest_n:
+        tok = m_latest_n.group(1) or m_latest_n.group(2) or ""
+        parsed_n = _parse_num_token(tok)
+        count = int(parsed_n) if parsed_n is not None else 0
+        if count <= 0:
+            raise CommandUsageError("批量最新话数量必须大于 0。")
+        if count > limit:
+            raise CommandUsageError(
+                f"单次批量请求共 {count} 话，超出当前单次批量上限（{limit} 话）；"
+                f"请缩小范围或在插件设置中调大 delivery.max_batch_chapters。"
+            )
+        if not chapters:
+            raise ChapterNotFoundError(f"《{manga_title}》暂无可用章节列表")
+
+        regular = [c for c in chapters if c.kind == ChapterKind.CHAPTER]
+        pool = regular if regular else chapters
+        non_trial = [c for c in pool if not _effective_meta(c)[2]]
+        if non_trial:
+            pool = non_trial
+        canonical = _dedupe_numbered_pool(pool)
+        if canonical:
+            return canonical[-count:]
+        ordered_fallback = sorted(
+            pool,
+            key=lambda c: (c.updated_at if c.updated_at > 0 else 0, c.order_index),
+        )
+        return ordered_fallback[-count:]
+
+    # 2. 检查是否为区间或多话列表（如 `1-5话`、`1,3,5话`、`第二部 1-3话`、`1-3卷`）
+    part_num, body = _strip_leading_part_for_batch(simp)
+    has_list_sep = bool(_LIST_SEP_RE.search(body))
+    m_whole_range = None if has_list_sep else _BATCH_RANGE_SEG_RE.match(body)
+
+    if not has_list_sep and m_whole_range is None:
+        # 常规单话模式，100% 保持原行为
+        return [
+            select_matching_chapter(chapters, parse_chapter_target(raw), manga_title=manga_title)
+        ]
+
+    if not chapters:
+        raise ChapterNotFoundError(f"《{manga_title}》暂无可用章节列表")
+
+    is_vol = any(tok in body.lower() for tok in ("卷", "册", "单行本", "vol"))
+    segments = [s.strip() for s in _LIST_SEP_RE.split(body) if s.strip()]
+    if not segments:
+        raise CommandUsageError(f"无法解析批量话数「{raw}」")
+
+    collected: list[ChapterInfo] = []
+    seen_ids: set[str] = set()
+
+    for seg in segments:
+        m_seg_rng = _BATCH_RANGE_SEG_RE.match(seg)
+        if m_seg_rng:
+            n1 = _parse_num_token(m_seg_rng.group(1))
+            n2 = _parse_num_token(m_seg_rng.group(2))
+            if n1 is None or n2 is None:
+                raise CommandUsageError(f"无法识别区间话数「{seg}」")
+            lo, hi = (n1, n2) if n1 <= n2 else (n2, n1)
+            if (hi - lo) > max(500, limit * 5):
+                raise CommandUsageError(
+                    f"请求的区间跨度过大（{format_chapter_num(lo)}~{format_chapter_num(hi)}），"
+                    f"当前单次批量上限为 {limit} 话。"
+                )
+            seg_chaps = _expand_range_in_chapters(
+                chapters,
+                lo,
+                hi,
+                is_vol=is_vol,
+                part_num=part_num,
+                manga_title=manga_title,
+            )
+            for ch in seg_chaps:
+                if ch.chapter_id not in seen_ids:
+                    seen_ids.add(ch.chapter_id)
+                    collected.append(ch)
+                if len(collected) > limit:
+                    raise CommandUsageError(
+                        f"单次批量匹配超过当前上限（最多 {limit} 话）；"
+                        f"请缩小区间或在插件设置中调大 delivery.max_batch_chapters。"
+                    )
+        else:
+            if is_vol and not any(k in seg.lower() for k in ("卷", "册", "单行本", "vol")):
+                sub_spec = f"第{seg}卷"
+            elif part_num is not None:
+                sub_spec = f"第{part_num}部 {seg}"
+            else:
+                sub_spec = seg
+            ch = select_matching_chapter(
+                chapters,
+                parse_chapter_target(sub_spec),
+                manga_title=manga_title,
+            )
+            if ch.chapter_id not in seen_ids:
+                seen_ids.add(ch.chapter_id)
+                collected.append(ch)
+            if len(collected) > limit:
+                raise CommandUsageError(
+                    f"单次批量请求超出当前上限（最多 {limit} 话）；"
+                    f"请减少话数或在插件设置中调大 delivery.max_batch_chapters。"
+                )
+
+    return collected

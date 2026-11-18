@@ -836,3 +836,64 @@ def test_missing_page_header_summary_and_placeholder_node(tmp_path: Path) -> Non
     slot2_txt = nodes[2].content[0].text
     assert "⚠️ 第 2 页经多次重试仍加载失败" in header_txt
     assert "⚠️ 第 2/3 页图片经多次重试仍加载失败（HTTP 502）" in slot2_txt
+
+
+@pytest.mark.asyncio
+async def test_batch_multi_chapter_streaming_send_and_mid_batch_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证批量多话流式逐话发送：首条带〔批量 k/N〕标识、上一话目录在下一话下载前已清空、中途单话异常自动跨源回退。"""
+    import main as main_mod
+
+    async def _fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(main_mod, "_resolve_plugin_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _fast_sleep)
+
+    class _MultiChapSource(_StubSource):
+        def __init__(self, source_id: SourceId, *, fail_on_ch2_pages: bool = False) -> None:
+            super().__init__(source_id, page_count=2)
+            self._fail_ch2 = fail_on_ch2_pages
+
+        async def fetch_chapters(self, manga: MangaCandidate) -> list[ChapterInfo]:
+            return [
+                ChapterInfo(chapter_id="c1", title="第1话", number=1.0, kind=ChapterKind.CHAPTER),
+                ChapterInfo(chapter_id="c2", title="第2话", number=2.0, kind=ChapterKind.CHAPTER),
+                ChapterInfo(chapter_id="c3", title="第3话", number=3.0, kind=ChapterKind.CHAPTER),
+            ]
+
+        async def fetch_chapter_pages(
+            self, manga: MangaCandidate, chapter: ChapterInfo
+        ) -> list[PageSpec]:
+            if self._fail_ch2 and chapter.chapter_id == "c2":
+                raise SourceThrottleError("第2话主源临时故障")
+            return await super().fetch_chapter_pages(manga, chapter)
+
+    plugin = MangaForwardPlugin(
+        context=object(),  # type: ignore[arg-type]
+        config={
+            "source_priority": ["zaimanhua", "copymanga"],
+            "comments": {"enable_comments": False},
+            "delivery": {"max_batch_chapters": 5, "send_wait_tip": False},
+        },  # type: ignore[arg-type]
+    )
+    plugin._orchestrator._downloader = ChapterImageDownloader(_DelayedImageHttp())  # type: ignore[arg-type]
+    plugin._orchestrator._sources[SourceId.ZAIMANHUA] = _MultiChapSource(
+        SourceId.ZAIMANHUA, fail_on_ch2_pages=True
+    )
+    plugin._orchestrator._sources[SourceId.COPYMANGA] = _MultiChapSource(SourceId.COPYMANGA)
+
+    await plugin.initialize()
+    try:
+        ev = _DummyEvent("aiocqhttp", "/manga 电锯人 1-3话")
+        replies = [r async for r in plugin.cmd_manga(ev)]  # type: ignore[arg-type]
+        assert replies == []
+        # 连续发出 3 条合并转发（第1话走再漫画、第2话自动回退拷贝漫画补偿、第3话继续走再漫画）
+        assert len(ev.sent_chains) == 3
+        headers = [chain.chain[0].nodes[0].content[0].text for chain in ev.sent_chains]
+        assert "第1话 〔批量 1/3〕" in headers[0] and "来源：再漫画" in headers[0]
+        assert "第2话 〔批量 2/3〕" in headers[1] and "来源：拷贝漫画" in headers[1]
+        assert "第3话 〔批量 3/3〕" in headers[2] and "来源：再漫画" in headers[2]
+    finally:
+        await plugin.terminate()

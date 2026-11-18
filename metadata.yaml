@@ -2,7 +2,7 @@ name: astrbot_plugin_manga_forward
 display_name: 漫画点播
 short_desc: 通过 manga 指令跨源检索并解析再漫画、拷贝漫画、Komiic 整话漫画，经 OneBot v11 合并转发按序发送并附带单话评论/章末吐槽
 desc: 支持通过 manga 指令（如 /manga 漫画名 第几话）按自定义优先级跨源检索再漫画（基于第三方离线索引站）、拷贝漫画与 Komiic，支持再漫画与 Komiic 账号密码登录持久化及过期自动刷新（或直接配置 Cookie），保证整话图片顺序并以一张图片一条消息的合并转发形式推送，再漫画与拷贝漫画源支持附带章末吐槽/单话评论。
-version: v0.1.8
+version: v0.2.0
 author: Volundio
 repo: https://github.com/Volundio/astrbot-plugin-manga-forward
 support_platforms:

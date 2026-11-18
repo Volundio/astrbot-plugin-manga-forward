@@ -157,20 +157,37 @@ class MangaForwardPlugin(Star):
 
         temp_scope = self._temp_mgr.create_scope()
         umo = getattr(event, "unified_msg_origin", None)
+        sent_chapters = 0
         try:
-            bundle = await self._orchestrator.resolve_and_download(
+            async for chap_idx, chap_total, bundle in self._orchestrator.iter_resolved_chapters(
                 parsed_cmd,
                 temp_scope,
                 umo=str(umo) if umo else None,
-            )
-            await send_chapter_forward_batches(event, bundle, cfg.delivery)
+            ):
+                await send_chapter_forward_batches(
+                    event,
+                    bundle,
+                    cfg.delivery,
+                    batch_progress=(chap_idx, chap_total),
+                )
+                sent_chapters += 1
+                if chap_idx < chap_total:
+                    await asyncio.sleep(1.2)
         except MangaForwardError as exc:
             safe_msg = redact_secrets(str(exc), secrets)
-            yield event.plain_result(f"❌ {safe_msg}")
+            prefix = (
+                f"⚠️ 已发送前 {sent_chapters} 话，后续章节中断：" if sent_chapters > 0 else "❌ "
+            )
+            yield event.plain_result(f"{prefix}{safe_msg}")
         except Exception as exc:
             safe_err = redact_secrets(f"{type(exc).__name__}: {exc}", secrets)
             logger.exception(f"处理 manga 指令发生未预期异常：{safe_err}")
-            yield event.plain_result(f"❌ 解析或发送漫画时发生异常：{safe_err}")
+            prefix = (
+                f"⚠️ 已发送前 {sent_chapters} 话，后续章节发生异常："
+                if sent_chapters > 0
+                else "❌ 解析或发送漫画时发生异常："
+            )
+            yield event.plain_result(f"{prefix}{safe_err}")
         finally:
             if wait_msg_id is not None and cfg.delivery.recall_wait_tip:
                 await recall_wait_tip(event, wait_msg_id)

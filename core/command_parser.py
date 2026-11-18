@@ -7,11 +7,13 @@ import re
 from .models import CommandUsageError, ParsedMangaCommand, SourceId
 
 USAGE_TEXT = (
-    "📖 指令用法：manga <漫画名> <第几话>\n"
+    "📖 指令用法：manga <漫画名> <第几话>（支持单话与批量话数）\n"
     "示例：\n"
     "  manga 电锯人 第1话\n"
-    "  manga 异剑战记 第二话\n"
-    "  manga 异剑战记 第二部 13话\n"
+    "  manga 电锯人 1-5话          （连续多话批量发送）\n"
+    "  manga 电锯人 1,3,5话        （指定多话批量发送）\n"
+    "  manga 黑暗集会 最新3话      （最近 N 话批量发送）\n"
+    "  manga 异剑战记 第二部 1-3话\n"
     "  manga 孤独摇滚 第1卷\n"
     "  manga 药屋少女的呢喃 最新话\n"
     "（可选追加 -s 再漫画 / -s 拷贝 / -s komiic 临时指定源）"
@@ -42,15 +44,18 @@ _SUBPART_TOKEN_RE = re.compile(
     r"^[（(【\[]?(?:前篇|中篇|后篇|後篇|上篇?|中篇?|下篇?|[①②③④⑤⑥])[）)】\]]?$"
 )
 
-# 识别话数主 token（如 "13"、"13话"、"第13话"、"最新话"）
+# 识别区间连接词 token（支持用户在区间连接符两侧留空格，如 `1 - 5话`、`第1话 到 第5话`）
+_RANGE_CONN_TOKEN_RE = re.compile(r"^(?:[-~～—–]|(?:\.\.)|至|到)$")
+
+# 识别话数主 token（如 "13"、"13话"、"1-5话"、"1,3,5话"、"最新3话"、"最新话"）
 _CHAPTER_LIKE_TOKEN_RE = re.compile(
-    rf"^(?:(?:第\s*)?[{_NUM_CHARS}]+\s*(?:话|話|回|章|集|卷|册|冊)?.*|ch\.?\d+.*|ep\.?\d+.*|vol\.?\d+.*|最新[话話章回]?|序[章话話]?)$",
+    rf"^(?:(?:第\s*)?[{_NUM_CHARS}]+\s*(?:话|話|回|章|集|卷|册|冊)?.*|ch\.?\d+.*|ep\.?\d+.*|vol\.?\d+.*|(?:最新|最近|最后|最後)[{_NUM_CHARS}]*[话話章回集]?|latest\d*|序[章话話]?)$",
     re.IGNORECASE,
 )
 
-# 支持无空格粘连形式兜底：如 "电锯人第12话" / "异剑战记第二部第2话" / "电锯人最新话"
+# 支持无空格粘连形式兜底：如 "电锯人第12话" / "电锯人第1-5话" / "电锯人最新3话" / "电锯人最新话"
 _GLUED_CHAPTER_RE = re.compile(
-    rf"^(.+?)((?:第[{_NUM_CHARS}]+[部季篇章]\s*)?(?:第[{_NUM_CHARS}]+[话話章回卷].*|最新[话話章回]?))$"
+    rf"^(.+?)((?:第[{_NUM_CHARS}]+[部季篇章]\s*)?(?:第[{_NUM_CHARS}]+[话話章回卷\-~～至到,，、].*|(?:最新|最近|最后|最後)[{_NUM_CHARS}]*[话話章回集]?))$"
 )
 
 # 支持显式源前缀 ID，如 zmh:57069 / copy:dianjuren / komiic:294
@@ -105,7 +110,19 @@ def _split_unquoted_manga_and_chapter(text: str) -> tuple[str, str]:
             return _strip_outer_quotes(" ".join(tokens[:-3])), " ".join(tokens[-3:])
         return _strip_outer_quotes(" ".join(tokens[:-2])), " ".join(tokens[-2:])
 
-    # 情况 B：末尾两个 token 构成 `<第X部/章/季/篇> <第Y话>`，如 `异剑战记 第二章 13话` / `异剑战记 第二部 06话`
+    # 情况 B：末尾为带空格的区间连接符，如 `电锯人 1 - 5话`、`异剑战记 第二部 1 到 3话`
+    if (
+        len(tokens) >= 4
+        and _RANGE_CONN_TOKEN_RE.match(tokens[-2])
+        and _CHAPTER_LIKE_TOKEN_RE.match(tokens[-3])
+        and _CHAPTER_LIKE_TOKEN_RE.match(tokens[-1])
+    ):
+        merged_range = f"{tokens[-3]}-{tokens[-1]}"
+        if len(tokens) >= 5 and _PART_TOKEN_RE.match(tokens[-4]):
+            return _strip_outer_quotes(" ".join(tokens[:-4])), f"{tokens[-4]} {merged_range}"
+        return _strip_outer_quotes(" ".join(tokens[:-3])), merged_range
+
+    # 情况 C：末尾两个 token 构成 `<第X部/章/季/篇> <第Y话/区间>`，如 `异剑战记 第二章 13话` / `异剑战记 第二部 1-3话`
     if (
         len(tokens) >= 3
         and _PART_TOKEN_RE.match(tokens[-2])
@@ -113,7 +130,7 @@ def _split_unquoted_manga_and_chapter(text: str) -> tuple[str, str]:
     ):
         return _strip_outer_quotes(" ".join(tokens[:-2])), f"{tokens[-2]} {tokens[-1]}"
 
-    # 情况 C：常规右侧单 token 切分（左侧完整保留可能含空格的漫画名）
+    # 情况 D：常规右侧单 token 切分（左侧完整保留可能含空格的漫画名）
     parts = text.rsplit(maxsplit=1)
     return _strip_outer_quotes(parts[0]), parts[1].strip()
 

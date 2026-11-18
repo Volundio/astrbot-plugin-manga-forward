@@ -182,6 +182,7 @@ def build_forward_node_batches(
     delivery_cfg: DeliveryConfig,
     *,
     bot_uin: str,
+    batch_progress: tuple[int, int] | None = None,
 ) -> list[list[Comp.Node]]:
     """构建符合 OneBot v11 规范的合并转发批次。
 
@@ -205,6 +206,11 @@ def build_forward_node_batches(
     manga_title = bundle.manga.title
     chap_title = bundle.chapter.title
     src_name = bundle.source.display_name
+    chap_badge = (
+        f" 〔批量 {batch_progress[0]}/{batch_progress[1]}〕"
+        if (batch_progress is not None and batch_progress[1] > 1)
+        else ""
+    )
 
     for b_idx, p_batch in enumerate(page_batches, start=1):
         nodes: list[Comp.Node] = []
@@ -212,7 +218,7 @@ def build_forward_node_batches(
         if delivery_cfg.include_header_node:
             part_suffix = f"（第 {b_idx}/{total_batches} 部分）" if total_batches > 1 else ""
             header_lines = [
-                f"📖 《{manga_title}》 {chap_title}{part_suffix}",
+                f"📖 《{manga_title}》 {chap_title}{chap_badge}{part_suffix}",
                 f"来源：{src_name}  |  本话共 {total_pages} 页",
             ]
             missing_tip = _format_missing_pages_notice(p_batch)
@@ -320,6 +326,8 @@ async def send_chapter_forward_batches(
     event: AstrMessageEvent,
     bundle: ResolvedChapterBundle,
     delivery_cfg: DeliveryConfig,
+    *,
+    batch_progress: tuple[int, int] | None = None,
 ) -> None:
     """逐批构建、发送合并转发并立即释放已发批次图片与内存，杜绝多批次 Base64 叠加内存溢出。"""
     bot_uin = resolve_bot_uin(event)
@@ -336,6 +344,11 @@ async def send_chapter_forward_batches(
     manga_title = bundle.manga.title
     chap_title = bundle.chapter.title
     src_name = bundle.source.display_name
+    chap_badge = (
+        f" 〔批量 {batch_progress[0]}/{batch_progress[1]}〕"
+        if (batch_progress is not None and batch_progress[1] > 1)
+        else ""
+    )
 
     for b_idx, p_batch in enumerate(page_batches, start=1):
         is_last_batch = b_idx == total_batches
@@ -354,7 +367,7 @@ async def send_chapter_forward_batches(
         if delivery_cfg.include_header_node:
             part_suffix = f"（第 {b_idx}/{total_batches} 部分）" if total_batches > 1 else ""
             header_lines = [
-                f"📖 《{manga_title}》 {chap_title}{part_suffix}",
+                f"📖 《{manga_title}》 {chap_title}{chap_badge}{part_suffix}",
                 f"来源：{src_name}  |  本话共 {total_pages} 页",
             ]
             missing_tip = _format_missing_pages_notice(p_batch)
