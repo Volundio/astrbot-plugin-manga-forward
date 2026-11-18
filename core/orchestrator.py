@@ -84,6 +84,7 @@ class MangaForwardOrchestrator:
         self._http = AsyncHttpClient(
             timeout_sec=cfg.network.request_timeout_sec,
             proxy=cfg.network.proxy,
+            fallback_proxy=self._resolve_fallback_proxy(),
         )
         self._auth = AuthManager(data_dir / "auth_state.json", self._http)
         self._zmh_shadow = ZmhShadowSearchClient(data_dir / "zmh_index_cache", self._http)
@@ -126,10 +127,32 @@ class MangaForwardOrchestrator:
             cfg.komiic.cookie,
         ]
 
+    def _resolve_fallback_proxy(self) -> str:
+        """若插件未单独填写 `network.proxy`，自动探测本机 AstrBot 全局 `http_proxy` 或环境变量代理作为回退。"""
+        if self._context is not None:
+            get_cfg = getattr(self._context, "get_config", None)
+            if callable(get_cfg):
+                try:
+                    ab_cfg = get_cfg()
+                    if ab_cfg is not None and callable(getattr(ab_cfg, "get", None)):
+                        gp = str(ab_cfg.get("http_proxy") or "").strip()
+                        if gp:
+                            return gp
+                except Exception:
+                    pass
+        import os
+
+        for env_key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            val = os.environ.get(env_key, "").strip()
+            if val:
+                return val
+        return ""
+
     def _sync_runtime_limits(self, cfg: PluginConfig) -> None:
         self._http.update_settings(
             timeout_sec=cfg.network.request_timeout_sec,
             proxy=cfg.network.proxy,
+            fallback_proxy=self._resolve_fallback_proxy(),
         )
         self._task_limiter.update_limits(
             cfg.network.max_concurrent_tasks,
@@ -202,7 +225,7 @@ class MangaForwardOrchestrator:
                     return bundle
                 except MangaForwardError as exc:
                     safe_reason = redact_secrets(str(exc), secrets)
-                    logger.info(
+                    logger.warning(
                         f"[{src_id.display_name}] 未能完成《{cmd.manga_query}》"
                         f"({cmd.chapter_spec})，准备尝试下一优先级源：{safe_reason}"
                     )

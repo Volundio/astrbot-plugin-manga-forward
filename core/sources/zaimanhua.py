@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -52,6 +53,8 @@ class ZaimanhuaSource(BaseMangaSource):
         self._http = http
         self._auth = auth
         self._shadow_index = shadow_index
+        self._refresh_pages_lock = asyncio.Lock()
+        self._refreshed_pages_cache: dict[tuple[str, str], tuple[float, list[PageSpec]]] = {}
 
     @property
     def cfg(self) -> ZaimanhuaConfig:
@@ -332,8 +335,20 @@ class ZaimanhuaSource(BaseMangaSource):
         chapter: ChapterInfo,
         page_index: int,
     ) -> PageSpec | None:
+        key = (manga.manga_id, chapter.chapter_id)
         try:
-            refreshed = await self._fetch_chapter_pages_internal(manga, chapter, bust_cache=True)
+            async with self._refresh_pages_lock:
+                now = time.monotonic()
+                cached = self._refreshed_pages_cache.get(key)
+                if cached is not None and (now - cached[0]) < 15.0:
+                    refreshed = cached[1]
+                else:
+                    refreshed = await self._fetch_chapter_pages_internal(
+                        manga, chapter, bust_cache=True
+                    )
+                    if len(self._refreshed_pages_cache) >= 8:
+                        self._refreshed_pages_cache.clear()
+                    self._refreshed_pages_cache[key] = (now, refreshed)
             if 0 <= page_index < len(refreshed):
                 return refreshed[page_index]
         except Exception as exc:

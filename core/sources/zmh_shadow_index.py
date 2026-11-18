@@ -339,25 +339,36 @@ class ZmhShadowSearchClient:
                 except Exception:
                     pass
 
-        resp = await self._http.get(
-            f"{origin}/{rel_path}",
-            headers={"Referer": f"{origin}/"},
-            timeout_sec=30.0,
-            max_bytes=16 * 1024 * 1024,
-        )
-        if resp.status != 200:
-            raise RuntimeError(f"拉取再漫画索引分片失败 ({rel_path}): HTTP {resp.status}")
-
-        decompressed = _maybe_gunzip(resp.body)
-        if sha256_hex:
-            raw_hash = hashlib.sha256(resp.body).hexdigest().lower()
-            dec_hash = hashlib.sha256(decompressed).hexdigest().lower()
-            if sha256_hex not in (raw_hash, dec_hash):
-                logger.debug(
-                    f"索引分片哈希提示 ({rel_path}): expected={sha256_hex[:12]}, got={dec_hash[:12]}"
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await self._http.get(
+                    f"{origin}/{rel_path}",
+                    headers={"Referer": f"{origin}/"},
+                    timeout_sec=35.0,
+                    max_bytes=16 * 1024 * 1024,
                 )
-            await asyncio.to_thread(self._write_cache_file_sync, sha256_hex, decompressed)
-        return decompressed
+                if resp.status == 200:
+                    decompressed = _maybe_gunzip(resp.body)
+                    if sha256_hex:
+                        raw_hash = hashlib.sha256(resp.body).hexdigest().lower()
+                        dec_hash = hashlib.sha256(decompressed).hexdigest().lower()
+                        if sha256_hex not in (raw_hash, dec_hash):
+                            logger.debug(
+                                f"索引分片哈希提示 ({rel_path}): expected={sha256_hex[:12]}, got={dec_hash[:12]}"
+                            )
+                        await asyncio.to_thread(
+                            self._write_cache_file_sync, sha256_hex, decompressed
+                        )
+                    return decompressed
+                last_err = RuntimeError(f"拉取再漫画索引分片失败 ({rel_path}): HTTP {resp.status}")
+            except Exception as exc:
+                last_err = exc
+            if attempt < 2:
+                await asyncio.sleep(0.6 * (attempt + 1))
+
+        assert last_err is not None
+        raise last_err
 
     @staticmethod
     def _read_and_touch_sync(path: Path) -> bytes:
@@ -498,15 +509,34 @@ class ZmhShadowSearchClient:
             ):
                 return self._loaded
 
-            manifest_resp = await self._http.get(
-                f"{origin}/assets/manifest.json",
-                headers={"Referer": f"{origin}/", "Cache-Control": "no-cache"},
-                timeout_sec=20.0,
-            )
-            if manifest_resp.status != 200:
-                raise RuntimeError(
-                    f"请求再漫画搜索站 manifest.json 失败: HTTP {manifest_resp.status}"
-                )
+            manifest_resp = None
+            last_m_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    manifest_resp = await self._http.get(
+                        f"{origin}/assets/manifest.json",
+                        headers={"Referer": f"{origin}/", "Cache-Control": "no-cache"},
+                        timeout_sec=25.0,
+                    )
+                    if manifest_resp.status == 200:
+                        break
+                    last_m_err = RuntimeError(
+                        f"请求再漫画搜索站 manifest.json 失败: HTTP {manifest_resp.status}"
+                    )
+                except Exception as exc:
+                    last_m_err = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+
+            if manifest_resp is None or manifest_resp.status != 200:
+                if self._loaded is not None and self._loaded.origin == origin:
+                    logger.warning(
+                        f"刷新再漫画索引 manifest 异常，降级沿用已加载缓存索引：{last_m_err}"
+                    )
+                    return self._loaded
+                assert last_m_err is not None
+                raise last_m_err
+
             manifest = manifest_resp.json()
             stats = manifest.get("stats") or {}
             assets = manifest.get("assets") or {}

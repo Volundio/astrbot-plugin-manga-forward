@@ -82,17 +82,37 @@ class AsyncHttpClient:
         *,
         timeout_sec: float = 20.0,
         proxy: str = "",
+        fallback_proxy: str = "",
         verify_ssl: bool = True,
     ) -> None:
         self._timeout_sec = max(5.0, float(timeout_sec))
         self._proxy = (proxy or "").strip() or None
+        self._fallback_proxy = (fallback_proxy or "").strip() or None
         self._verify_ssl = verify_ssl
         self._session: aiohttp.ClientSession | None = None
         self._lock = asyncio.Lock()
 
-    def update_settings(self, *, timeout_sec: float, proxy: str) -> None:
+    def update_settings(
+        self,
+        *,
+        timeout_sec: float,
+        proxy: str,
+        fallback_proxy: str = "",
+    ) -> None:
         self._timeout_sec = max(5.0, float(timeout_sec))
         self._proxy = (proxy or "").strip() or None
+        self._fallback_proxy = (fallback_proxy or "").strip() or None
+
+    def _proxy_candidates_for_url(self, url: str) -> list[str | None]:
+        """智能分流：国内再漫画域名优先直连（失败回退代理），海外/Cloudflare 域名优先走代理（失败回退直连）。"""
+        lower_url = url.lower()
+        eff_proxy = self._proxy or self._fallback_proxy
+        is_domestic_zmh = ".zaimanhua.com" in lower_url or "://zaimanhua.com" in lower_url
+        if is_domestic_zmh:
+            return [None, eff_proxy] if eff_proxy else [None]
+        if eff_proxy:
+            return [eff_proxy, None]
+        return [None]
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is not None and not self._session.closed:
@@ -141,14 +161,14 @@ class AsyncHttpClient:
         if headers:
             merged_headers.update(headers)
 
-        async def _do_call(ssl_param: bool | None) -> HttpResponseData:
+        async def _do_call(proxy_val: str | None, ssl_param: bool | None) -> HttpResponseData:
             kwargs: dict[str, Any] = {
                 "headers": merged_headers,
                 "params": params,
                 "json": json_body,
                 "data": form_data,
                 "timeout": eff_timeout,
-                "proxy": self._proxy,
+                "proxy": proxy_val,
             }
             if ssl_param is not None:
                 kwargs["ssl"] = ssl_param
@@ -172,12 +192,25 @@ class AsyncHttpClient:
                     url=str(resp.url),
                 )
 
-        try:
-            return await _do_call(None)
-        except aiohttp.ClientConnectorCertificateError:
-            if allow_ssl_Disable_retry:
-                return await _do_call(False)
-            raise
+        proxy_candidates = self._proxy_candidates_for_url(url)
+        last_exc: Exception | None = None
+        for p_idx, p_val in enumerate(proxy_candidates):
+            try:
+                return await _do_call(p_val, None)
+            except aiohttp.ClientConnectorCertificateError as exc:
+                last_exc = exc
+                if allow_ssl_Disable_retry:
+                    try:
+                        return await _do_call(p_val, False)
+                    except Exception as inner_exc:
+                        last_exc = inner_exc
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                if p_idx + 1 < len(proxy_candidates):
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
 
     async def stream_to_file(
         self,
@@ -200,69 +233,84 @@ class AsyncHttpClient:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
-        async with session.request(
-            method.upper(),
-            url,
-            headers=merged_headers,
-            json=json_body,
-            timeout=eff_timeout,
-            proxy=self._proxy,
-        ) as resp:
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            if resp.status != 200:
-                err_buf = bytearray()
-                async for chunk in resp.content.iter_chunked(4096):
-                    err_buf.extend(chunk)
-                    if len(err_buf) >= 512:
-                        break
-                preview = bytes(err_buf[:256]).decode("utf-8", errors="replace")
+        async def _stream_once(proxy_val: str | None) -> HttpStreamResult:
+            async with session.request(
+                method.upper(),
+                url,
+                headers=merged_headers,
+                json=json_body,
+                timeout=eff_timeout,
+                proxy=proxy_val,
+            ) as resp:
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                if resp.status != 200:
+                    err_buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(4096):
+                        err_buf.extend(chunk)
+                        if len(err_buf) >= 512:
+                            break
+                    preview = bytes(err_buf[:256]).decode("utf-8", errors="replace")
+                    return HttpStreamResult(
+                        status=resp.status,
+                        headers=resp_headers,
+                        size_bytes=0,
+                        head_bytes=b"",
+                        error_preview=preview,
+                    )
+
+                cl_str = resp_headers.get("content-length") or ""
+                if cl_str.isdigit() and int(cl_str) > max_bytes:
+                    raise ValueError(f"远端声明文件体积超限 ({cl_str} > {max_bytes} bytes)")
+
+                head_buf = bytearray()
+                total_written = 0
+                fd = await asyncio.to_thread(
+                    os.open,
+                    str(part_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    0o644,
+                )
+                try:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        if not chunk:
+                            continue
+                        if len(head_buf) < 32:
+                            need = 32 - len(head_buf)
+                            head_buf.extend(chunk[:need])
+                        total_written += len(chunk)
+                        if total_written > max_bytes:
+                            raise ValueError(
+                                f"流式下载体积超出安全上限 ({total_written} > {max_bytes} bytes)"
+                            )
+                        await asyncio.to_thread(os.write, fd, chunk)
+                except BaseException:
+                    await asyncio.to_thread(os.close, fd)
+                    part_path.unlink(missing_ok=True)
+                    raise
+                else:
+                    await asyncio.to_thread(os.close, fd)
+
+                await asyncio.to_thread(os.replace, part_path, dest_path)
                 return HttpStreamResult(
-                    status=resp.status,
+                    status=200,
                     headers=resp_headers,
-                    size_bytes=0,
-                    head_bytes=b"",
-                    error_preview=preview,
+                    size_bytes=total_written,
+                    head_bytes=bytes(head_buf),
                 )
 
-            cl_str = resp_headers.get("content-length") or ""
-            if cl_str.isdigit() and int(cl_str) > max_bytes:
-                raise ValueError(f"远端声明文件体积超限 ({cl_str} > {max_bytes} bytes)")
-
-            head_buf = bytearray()
-            total_written = 0
-            fd = await asyncio.to_thread(
-                os.open,
-                str(part_path),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o644,
-            )
+        proxy_candidates = self._proxy_candidates_for_url(url)
+        last_exc: Exception | None = None
+        for p_idx, p_val in enumerate(proxy_candidates):
             try:
-                async for chunk in resp.content.iter_chunked(65536):
-                    if not chunk:
-                        continue
-                    if len(head_buf) < 32:
-                        need = 32 - len(head_buf)
-                        head_buf.extend(chunk[:need])
-                    total_written += len(chunk)
-                    if total_written > max_bytes:
-                        raise ValueError(
-                            f"流式下载体积超出安全上限 ({total_written} > {max_bytes} bytes)"
-                        )
-                    await asyncio.to_thread(os.write, fd, chunk)
-            except BaseException:
-                await asyncio.to_thread(os.close, fd)
+                return await _stream_once(p_val)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 part_path.unlink(missing_ok=True)
+                last_exc = exc
+                if p_idx + 1 < len(proxy_candidates):
+                    continue
                 raise
-            else:
-                await asyncio.to_thread(os.close, fd)
-
-            await asyncio.to_thread(os.replace, part_path, dest_path)
-            return HttpStreamResult(
-                status=200,
-                headers=resp_headers,
-                size_bytes=total_written,
-                head_bytes=bytes(head_buf),
-            )
+        assert last_exc is not None
+        raise last_exc
 
     async def get(
         self,

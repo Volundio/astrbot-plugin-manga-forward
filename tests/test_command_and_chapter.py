@@ -234,3 +234,47 @@ def test_volundio_multi_part_and_chapter_prefix_disambiguation() -> None:
 
     # 6. `最新话` 应正确识别第二部最新进度 `第二部 17话`（而非第一部的 54 话）
     assert select_matching_chapter(chapters, parse_chapter_target("最新话")).title == "第二部 17话"
+
+
+def test_kanokari_latest_chapter_ignores_birthday_extras_and_reuploaded_volumes() -> None:
+    """回归测试《女朋友、借我一下 / 租借女友》真实场景：
+    1. 拷贝漫画 `2026和也生日` 绝不能将年份 2026 误识别为第 2026 话抢占 `最新话`；
+    2. 再漫画连载组内的无“第”字单行本 `34卷`（即使补传后 `updated_at` 比 `448话` 更新）必须归为 `VOLUME`，绝不污染 `最新话`。
+    """
+    raw_items = [
+        ("34卷", "连载", 1795001239),
+        ("2026和也生日", "默認", 1795002000),
+        ("2026和也祭典", "默認", 1795002500),
+        ("08卷特典", "其他系列", 1795003000),
+        ("406话试看", "其它汉化版", 0),
+        ("447话", "连载", 1793937516),
+        ("第448话", "默認", 1794492395),
+    ]
+    chapters: list[ChapterInfo] = []
+    for idx, (title, grp, upd) in enumerate(raw_items):
+        meta = analyze_chapter_meta(title, grp)
+        chapters.append(
+            ChapterInfo(
+                chapter_id=f"k_{idx}",
+                title=title,
+                number=meta.number,
+                part_number=meta.part_number,
+                sub_order=meta.sub_order,
+                is_trial=meta.is_trial,
+                kind=meta.kind,
+                group_name=grp,
+                order_index=idx * 10,
+                updated_at=upd,
+            )
+        )
+
+    assert chapters[0].kind == ChapterKind.VOLUME and chapters[0].number == 34.0
+    assert chapters[1].kind == ChapterKind.SPECIAL
+    assert chapters[2].kind == ChapterKind.SPECIAL and chapters[2].number is None
+    assert chapters[3].kind == ChapterKind.SPECIAL
+
+    latest = select_matching_chapter(chapters, parse_chapter_target("最新话"), "女朋友、借我一下")
+    assert latest.title == "第448话"
+
+    vol34 = select_matching_chapter(chapters, parse_chapter_target("34卷"), "女朋友、借我一下")
+    assert vol34.title == "34卷"

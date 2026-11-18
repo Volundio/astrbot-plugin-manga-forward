@@ -152,7 +152,7 @@ class PluginConfig:
                 or DEFAULT_ZMH_SEARCH_URL
             ),
             need_login_filter=need_login_val,
-            username=str(zmh_raw.get("username") or "").strip(),
+            username=str(zmh_raw.get("username") or "").strip().strip("\"'“”"),
             password=str(zmh_raw.get("password") or ""),
             cookie=str(zmh_raw.get("cookie") or "").strip(),
             prefer_cookie=bool(zmh_raw.get("prefer_cookie", False)),

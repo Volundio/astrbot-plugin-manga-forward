@@ -27,7 +27,18 @@ _NUM_PAT = r"(?:\d+(?:\.\d+)?|[零〇一壹二贰两兩三叁四肆五伍六陆�
 
 _LATEST_KEYWORDS = {"最新", "最新话", "最新章", "最新回", "最后一话", "latest"}
 _VOLUME_GROUP_KEYWORDS = ("单行本", "卷", "volume", "book", "tankobon")
-_SPECIAL_GROUP_KEYWORDS = ("番外", "特别", "外传", "其他", "附录", "同人", "短篇")
+_SPECIAL_GROUP_KEYWORDS = (
+    "番外",
+    "特别",
+    "外传",
+    "其他",
+    "其它",
+    "附录",
+    "同人",
+    "短篇",
+    "画集",
+    "特典",
+)
 
 # 非正篇杂项词：一旦标题命中这些词且不是标准“第X话”正篇，一律归入 SPECIAL 防止数字误匹配
 _EXTRA_OMAKE_KEYWORDS = (
@@ -40,9 +51,21 @@ _EXTRA_OMAKE_KEYWORDS = (
     "附录",
     "附赠",
     "附加",
+    "特典",
+    "画集",
+    "公式书",
+    "粉丝书",
     "插画",
     "彩页",
     "尾页",
+    "贺图",
+    "生日",
+    "纪念",
+    "祝贺",
+    "圣诞",
+    "新年",
+    "情人节",
+    "万圣节",
     "合集",
     "情报",
     "发表",
@@ -50,7 +73,10 @@ _EXTRA_OMAKE_KEYWORDS = (
     "通知",
     "公告",
     "预告",
+    "宣传",
+    "壁纸",
     "后记",
+    "补完",
     "设定集",
     "访谈",
     "角色介绍",
@@ -193,10 +219,10 @@ def analyze_chapter_meta(
                 is_trial=is_trial,
             )
 
-    # 4. 识别单行本/卷（分组名为单行本/book，或标题含 "第X卷" / "Vol.X" / "卷X"）
+    # 4. 识别单行本/卷（分组名为单行本/book，或标题含 "第X卷" / "34卷" / "Vol.X" / "卷X"）
     is_vol_title = bool(
         re.search(
-            rf"(?:第\s*{_NUM_PAT}\s*[卷册]|^卷\s*\d|^vol\.?\s*\d|单行本)",
+            rf"(?:(?:第\s*)?{_NUM_PAT}\s*[卷册冊]|^卷\s*{_NUM_PAT}|^vol\.?\s*\d|单行本)",
             work_body,
             re.IGNORECASE,
         )
@@ -205,7 +231,8 @@ def analyze_chapter_meta(
         kw in simp_group for kw in _VOLUME_GROUP_KEYWORDS
     )
     if is_vol_title or is_vol_group:
-        m_vol = _EXPLICIT_VOL_NUM_RE.search(work_body)
+        m_vol_unit = re.search(rf"(?:第\s*)?({_NUM_PAT})\s*[卷册冊]", work_body, re.IGNORECASE)
+        m_vol = m_vol_unit or _EXPLICIT_VOL_NUM_RE.search(work_body)
         num = _parse_num_token(m_vol.group(1)) if m_vol else extract_number_from_text(work_body)
         return ClassifiedChapterMeta(
             kind=ChapterKind.VOLUME,
@@ -247,18 +274,11 @@ def analyze_chapter_meta(
                     is_trial=is_trial,
                 )
 
-    if any(kw in simp_group for kw in _SPECIAL_GROUP_KEYWORDS):
-        return ClassifiedChapterMeta(
-            kind=ChapterKind.SPECIAL,
-            number=extract_number_from_text(work_body),
-            part_number=part_number,
-            sub_order=sub_order,
-            is_trial=is_trial,
-        )
-
+    # 7. 未命中任何标准话数/卷数格式的杂项标题（如 "2026和也生日"、"角色设定"）：
+    # 严禁将年份/纪念数字误提取为正篇话数（防止 2026 > 448 污染“最新话”），统一归入 SPECIAL
     return ClassifiedChapterMeta(
-        kind=hint_kind or ChapterKind.CHAPTER,
-        number=extract_number_from_text(work_body),
+        kind=ChapterKind.VOLUME if hint_kind == ChapterKind.VOLUME else ChapterKind.SPECIAL,
+        number=None,
         part_number=part_number,
         sub_order=sub_order,
         is_trial=is_trial,
@@ -379,21 +399,41 @@ def _effective_meta(c: ChapterInfo) -> tuple[int | None, int, bool]:
     return analyzed.part_number, analyzed.sub_order, analyzed.is_trial
 
 
-def _describe_latest(chapters: list[ChapterInfo]) -> str:
-    if not chapters:
-        return ""
+def _pick_latest_chapter(chapters: list[ChapterInfo]) -> ChapterInfo:
+    """选择真实最新连载正篇：严格隔离卷与特典杂项，按篇章号 -> 话数优先，免疫旧话补页导致的更新时间戳倒挂。"""
     regular = [c for c in chapters if c.kind == ChapterKind.CHAPTER]
     pool = regular if regular else chapters
-    best = max(
+    non_trial = [c for c in pool if not _effective_meta(c)[2]]
+    if non_trial:
+        pool = non_trial
+
+    numbered = [c for c in pool if c.number is not None]
+    if numbered:
+        return max(
+            numbered,
+            key=lambda c: (
+                (_effective_meta(c)[0] or 1),
+                c.number if c.number is not None else -1.0,
+                _effective_meta(c)[1],
+                1 if c.group_name in ("", "连载", "默认", "默認", "default", "chapter") else 0,
+                c.updated_at if c.updated_at > 0 else 0,
+                c.order_index,
+            ),
+        )
+
+    return max(
         pool,
         key=lambda c: (
             c.updated_at if c.updated_at > 0 else 0,
-            (_effective_meta(c)[0] or 1),
-            c.number if c.number is not None else -1.0,
             c.order_index,
         ),
     )
-    return best.title
+
+
+def _describe_latest(chapters: list[ChapterInfo]) -> str:
+    if not chapters:
+        return ""
+    return _pick_latest_chapter(chapters).title
 
 
 def select_matching_chapter(
@@ -405,19 +445,9 @@ def select_matching_chapter(
     if not chapters:
         raise ChapterNotFoundError(f"《{manga_title}》暂无可用章节列表")
 
-    # 1. 最新话模式：兼顾更新时间、篇章号（第二部优先于第一部）、话数与列表序
+    # 1. 最新话模式：严格筛选正篇并按最新篇章与最高话数定位
     if target.mode == TargetMode.LATEST:
-        regular = [c for c in chapters if c.kind == ChapterKind.CHAPTER]
-        pool = regular if regular else chapters
-        return max(
-            pool,
-            key=lambda c: (
-                c.updated_at if c.updated_at > 0 else 0,
-                (_effective_meta(c)[0] or 1),
-                c.number if c.number is not None else -1.0,
-                c.order_index,
-            ),
-        )
+        return _pick_latest_chapter(chapters)
 
     # 2. 单行本整卷模式
     if target.mode == TargetMode.VOLUME and target.number is not None:

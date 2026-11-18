@@ -268,62 +268,78 @@ class AuthManager:
             return self._build_zmh_headers(token, cookies)
 
     async def _login_zaimanhua(self, username: str, password: str) -> tuple[str, dict[str, str]]:
-        """执行再漫画双通道账号密码登录（account-api 主通道 + i.zaimanhua.com 备选通道）。"""
-        passwd_md5 = hashlib.md5(password.encode("utf-8")).hexdigest().lower()
+        """执行再漫画双通道账号密码登录（兼容误粘首尾引号兜底）。"""
+        pwd_candidates = [password]
+        stripped_pwd = password.strip()
+        if (
+            len(stripped_pwd) >= 3
+            and stripped_pwd[0] in ('"', "'", "“")
+            and stripped_pwd[-1] in ('"', "'", "”")
+        ):
+            unquoted = stripped_pwd[1:-1]
+            if unquoted and unquoted not in pwd_candidates:
+                pwd_candidates.append(unquoted)
+
         errors: list[str] = []
+        for pwd_try in pwd_candidates:
+            passwd_md5 = hashlib.md5(pwd_try.encode("utf-8")).hexdigest().lower()
 
-        # 通道 1：Mihon 再漫画同款 account-api.zaimanhua.com/v1/login/passwd
-        try:
-            resp = await self._http.post(
-                ZMH_ACCOUNT_LOGIN_URL,
-                form_data={"username": username.strip(), "passwd": passwd_md5},
-                headers={"X-Requested-With": "XMLHttpRequest"},
-            )
-            if resp.status == 200:
-                payload = resp.json()
-                errno = payload.get("errno", 0)
-                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-                user_obj = (
-                    data.get("user") or data.get("userInfo") or (data if "token" in data else {})
+            # 通道 1：Mihon 再漫画同款 account-api.zaimanhua.com/v1/login/passwd
+            try:
+                resp = await self._http.post(
+                    ZMH_ACCOUNT_LOGIN_URL,
+                    form_data={"username": username.strip(), "passwd": passwd_md5},
+                    headers={"X-Requested-With": "XMLHttpRequest"},
                 )
-                token = (
-                    str(user_obj.get("token") or "").strip() if isinstance(user_obj, dict) else ""
-                )
-                if errno == 0 and token:
-                    cookies = dict(resp.cookies)
-                    cookies["token"] = token
-                    return token, cookies
-                errmsg = str(payload.get("errmsg") or f"errno={errno}")
-                errors.append(f"account-api: {errmsg}")
-            else:
-                errors.append(f"account-api HTTP {resp.status}")
-        except Exception as exc:
-            errors.append(f"account-api 异常: {exc}")
+                if resp.status == 200:
+                    payload = resp.json()
+                    errno = payload.get("errno", 0)
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                    user_obj = (
+                        data.get("user")
+                        or data.get("userInfo")
+                        or (data if "token" in data else {})
+                    )
+                    token = (
+                        str(user_obj.get("token") or "").strip()
+                        if isinstance(user_obj, dict)
+                        else ""
+                    )
+                    if errno == 0 and token:
+                        cookies = dict(resp.cookies)
+                        cookies["token"] = token
+                        return token, cookies
+                    errmsg = str(payload.get("errmsg") or f"errno={errno}")
+                    errors.append(f"account-api: {errmsg}")
+                else:
+                    errors.append(f"account-api HTTP {resp.status}")
+            except Exception as exc:
+                errors.append(f"account-api 异常: {exc}")
 
-        # 通道 2：再漫画签到脚本同款 i.zaimanhua.com/lpi/v1/login/passwd
-        try:
-            query = urlencode({"username": username.strip(), "passwd": passwd_md5})
-            resp2 = await self._http.post(f"{ZMH_PASSPORT_LOGIN_URL}?{query}")
-            if resp2.status == 200:
-                payload2 = resp2.json()
-                errno2 = payload2.get("errno", -1)
-                data2 = payload2.get("data") if isinstance(payload2.get("data"), dict) else {}
-                user2 = data2.get("user") or data2.get("userInfo") or data2
-                token2 = (
-                    str(user2.get("token") or payload2.get("token") or "").strip()
-                    if isinstance(user2, dict)
-                    else ""
-                )
-                if errno2 == 0 and token2:
-                    cookies2 = dict(resp2.cookies)
-                    cookies2["token"] = token2
-                    return token2, cookies2
-                errmsg2 = str(payload2.get("errmsg") or f"errno={errno2}")
-                errors.append(f"lpi: {errmsg2}")
-            else:
-                errors.append(f"lpi HTTP {resp2.status}")
-        except Exception as exc:
-            errors.append(f"lpi 异常: {exc}")
+            # 通道 2：再漫画签到脚本同款 i.zaimanhua.com/lpi/v1/login/passwd
+            try:
+                query = urlencode({"username": username.strip(), "passwd": passwd_md5})
+                resp2 = await self._http.post(f"{ZMH_PASSPORT_LOGIN_URL}?{query}")
+                if resp2.status == 200:
+                    payload2 = resp2.json()
+                    errno2 = payload2.get("errno", -1)
+                    data2 = payload2.get("data") if isinstance(payload2.get("data"), dict) else {}
+                    user2 = data2.get("user") or data2.get("userInfo") or data2
+                    token2 = (
+                        str(user2.get("token") or payload2.get("token") or "").strip()
+                        if isinstance(user2, dict)
+                        else ""
+                    )
+                    if errno2 == 0 and token2:
+                        cookies2 = dict(resp2.cookies)
+                        cookies2["token"] = token2
+                        return token2, cookies2
+                    errmsg2 = str(payload2.get("errmsg") or f"errno={errno2}")
+                    errors.append(f"lpi: {errmsg2}")
+                else:
+                    errors.append(f"lpi HTTP {resp2.status}")
+            except Exception as exc:
+                errors.append(f"lpi 异常: {exc}")
 
         raise SourceAuthError(f"再漫画账号自动登录失败（{'；'.join(errors)}）")
 
