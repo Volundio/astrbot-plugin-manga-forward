@@ -219,3 +219,61 @@ async def test_zmh_shadow_search_and_need_login_filters(tmp_path: Path) -> None:
         need_login_filter="any",
     )
     assert any(c.manga_id == "46598" for c in res_short)
+
+
+@pytest.mark.asyncio
+async def test_zmh_shadow_idle_ram_unload_and_disk_cache_cleanup(tmp_path: Path) -> None:
+    import os
+    import time
+
+    routes = _build_synthetic_zmh_index()
+    fake_http = _FakeShadowHttp(routes)
+    client = ZmhShadowSearchClient(tmp_path, fake_http)  # type: ignore[arg-type]
+
+    res1 = await client.search(
+        "电锯人",
+        site_url="https://zmh.shadows.de5.net/?needLogin=only1",
+        need_login_filter="any",
+    )
+    assert len(res1) == 1
+    assert client.is_index_loaded is True
+
+    # 模拟异常中断遗留的 .tmp/.part 垃圾文件以及超龄旧分片
+    tmp_garbage = tmp_path / "interrupted.bin.tmp"
+    part_garbage = tmp_path / "half.part"
+    expired_bin = tmp_path / ("cafe0000" * 8 + ".bin")
+    tmp_garbage.write_bytes(b"trash")
+    part_garbage.write_bytes(b"trash")
+    expired_bin.write_bytes(b"expired_shard")
+    old_ts = time.time() - 10 * 24 * 3600
+    os.utime(expired_bin, (old_ts, old_ts))
+
+    # 空闲超时触发内存索引卸载 + 垃圾与超龄分片清理
+    evicted, removed = await client.run_maintenance(
+        idle_unload_sec=0.0,
+        disk_max_age_sec=72 * 3600.0,
+        source_enabled=True,
+    )
+    assert evicted is True
+    assert client.is_index_loaded is False
+    assert removed == 3
+    assert not tmp_garbage.exists()
+    assert not part_garbage.exists()
+    assert not expired_bin.exists()
+
+    # 再次检索时自动从本地有效 .bin 缓存分片快速重载，无需重新通过网络拉取分片内容
+    fake_http.requested_urls.clear()
+    res2 = await client.search(
+        "电锯人",
+        site_url="https://zmh.shadows.de5.net/?needLogin=only1",
+        need_login_filter="any",
+    )
+    assert len(res2) == 1
+    assert client.is_index_loaded is True
+    assert fake_http.requested_urls == ["https://zmh.shadows.de5.net/assets/manifest.json"]
+
+    # 当用户禁用再漫画源时，自动彻底清空内存与本地索引目录
+    evicted_off, _ = await client.run_maintenance(source_enabled=False)
+    assert evicted_off is True
+    assert client.is_index_loaded is False
+    assert not tmp_path.exists()

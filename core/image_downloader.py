@@ -1,16 +1,19 @@
-"""章节图片有界并发保序下载器与请求级临时磁盘作用域管理。"""
+"""章节图片流式有界并发保序下载器与防泄漏临时磁盘作用域管理。"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 
-from .http_client import AsyncHttpClient
+from .http_client import AsyncHttpClient, HttpStreamResult
 from .models import (
     ChapterInfo,
     DownloadedPage,
@@ -23,7 +26,8 @@ from .models import (
 from .sources.base import BaseMangaSource
 
 MAX_SINGLE_IMAGE_BYTES = 18 * 1024 * 1024
-MAX_CHAPTER_TOTAL_BYTES = 220 * 1024 * 1024
+DEFAULT_MAX_CHAPTER_BYTES = 150 * 1024 * 1024
+MAX_TOTAL_TEMP_DIR_BYTES = 320 * 1024 * 1024
 
 
 def detect_image_extension(data: bytes) -> str | None:
@@ -43,11 +47,30 @@ def detect_image_extension(data: bytes) -> str | None:
     return None
 
 
-class TempScope:
-    """单次指令执行专属的临时落盘目录，发送结束后整目录原子清理。"""
+def _dir_size_sync(path: Path) -> int:
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for fname in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fname))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
 
-    def __init__(self, path: Path) -> None:
+
+class TempScope:
+    """单次指令执行专属的临时落盘目录，活跃态受保护、结束即整目录原子清理。"""
+
+    def __init__(
+        self,
+        path: Path,
+        on_release: Callable[[Path], None] | None = None,
+    ) -> None:
         self.path = path
+        self._on_release = on_release
         self._cleaned = False
 
     def subdir(self, name: str) -> Path:
@@ -64,45 +87,139 @@ class TempScope:
         if self._cleaned:
             return
         self._cleaned = True
+        if self._on_release is not None:
+            self._on_release(self.path)
         if self.path.exists():
             await asyncio.to_thread(shutil.rmtree, self.path, True)
 
 
 class TempDirManager:
-    """管理 `temp/` 根目录分配与残留过期目录后台巡检回收。"""
+    """管理 `temp/` 根目录分配、启动时崩溃残留清扫、活跃作用域保护及总容量上限驱逐。"""
 
-    def __init__(self, base_dir: Path, *, ttl_sec: float = 600.0) -> None:
+    def __init__(
+        self,
+        base_dir: Path,
+        *,
+        ttl_sec: float = 180.0,
+        max_total_bytes: int = MAX_TOTAL_TEMP_DIR_BYTES,
+    ) -> None:
         self._base_dir = base_dir
         self._ttl_sec = ttl_sec
+        self._max_total_bytes = max_total_bytes
+        self._active_scopes: set[Path] = set()
+
+    def _release_scope(self, path: Path) -> None:
+        self._active_scopes.discard(path)
 
     def create_scope(self) -> TempScope:
-        scope_dir = self._base_dir / f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        scope_dir = (self._base_dir / f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}").resolve()
         scope_dir.mkdir(parents=True, exist_ok=True)
-        return TempScope(scope_dir)
+        self._active_scopes.add(scope_dir)
+        return TempScope(scope_dir, on_release=self._release_scope)
 
-    async def cleanup_expired(self) -> int:
-        return await asyncio.to_thread(self._cleanup_expired_sync)
+    async def cleanup_expired(self, *, force_all_inactive: bool = False) -> int:
+        """清理过期或异常残留的临时目录与 `.part`/`.tmp` 垃圾文件（严格跳过活跃中的任务作用域）。"""
+        active_snapshot = set(self._active_scopes)
+        return await asyncio.to_thread(self._cleanup_sync, active_snapshot, force_all_inactive)
 
-    def _cleanup_expired_sync(self) -> int:
+    def _cleanup_sync(
+        self,
+        active_paths: set[Path],
+        force_all_inactive: bool,
+    ) -> int:
         if not self._base_dir.exists():
             return 0
         now = time.time()
         removed = 0
-        for child in self._base_dir.iterdir():
+        surviving_inactive: list[tuple[float, int, Path]] = []
+
+        for child in list(self._base_dir.iterdir()):
+            try:
+                resolved = child.resolve()
+            except OSError:
+                continue
+
+            if resolved in active_paths:
+                continue
+
+            if child.is_file():
+                child.unlink(missing_ok=True)
+                removed += 1
+                continue
+
             if not child.is_dir():
                 continue
+
             try:
                 mtime = child.stat().st_mtime
-                if (now - mtime) >= self._ttl_sec:
-                    shutil.rmtree(child, ignore_errors=True)
-                    removed += 1
-            except Exception:
-                pass
+            except OSError:
+                continue
+
+            if force_all_inactive or (now - mtime) >= self._ttl_sec:
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+            else:
+                surviving_inactive.append((mtime, _dir_size_sync(child), child))
+
+        # 总磁盘预算驱逐：若非活跃残留目录累计体积超限，按最旧优先回收
+        total_inactive_bytes = sum(sz for _, sz, _ in surviving_inactive)
+        if total_inactive_bytes > self._max_total_bytes:
+            surviving_inactive.sort(key=lambda item: item[0])
+            for _, sz, dir_path in surviving_inactive:
+                if total_inactive_bytes <= self._max_total_bytes:
+                    break
+                shutil.rmtree(dir_path, ignore_errors=True)
+                total_inactive_bytes -= sz
+                removed += 1
+
+        # 若 temp/ 根目录已完全为空，移除空目录保持整洁
+        try:
+            if not any(self._base_dir.iterdir()):
+                self._base_dir.rmdir()
+        except OSError:
+            pass
         return removed
 
 
+async def _stream_or_fallback_get(
+    http: Any,
+    url: str,
+    dest_path: Path,
+    *,
+    headers: dict[str, str],
+    max_bytes: int,
+) -> HttpStreamResult:
+    """优先调用 `stream_to_file` 64KB 流式落盘；兼容单元测试中仅实现 `.get()` 的轻量桩对象。"""
+    stream_fn = getattr(http, "stream_to_file", None)
+    if callable(stream_fn):
+        return await stream_fn(
+            "GET",
+            url,
+            dest_path,
+            headers=headers,
+            max_bytes=max_bytes,
+        )
+
+    resp = await http.get(url, headers=headers, max_bytes=max_bytes)
+    if resp.status != 200:
+        return HttpStreamResult(
+            status=resp.status,
+            headers=resp.headers,
+            size_bytes=0,
+            head_bytes=b"",
+        )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(dest_path.write_bytes, resp.body)
+    return HttpStreamResult(
+        status=200,
+        headers=resp.headers,
+        size_bytes=len(resp.body),
+        head_bytes=resp.body[:32],
+    )
+
+
 class ChapterImageDownloader:
-    """并发下载整话漫画图片，严格保证输出列表顺序为 `0..N-1`。"""
+    """流式并发下载整话漫画图片，严格保证输出列表顺序为 `0..N-1` 且内存占用恒定极低。"""
 
     def __init__(self, http: AsyncHttpClient) -> None:
         self._http = http
@@ -115,13 +232,13 @@ class ChapterImageDownloader:
         chapter: ChapterInfo,
         specs: list[PageSpec],
         dest_dir: Path,
-        concurrency: int = 6,
+        concurrency: int = 5,
+        max_chapter_bytes: int = DEFAULT_MAX_CHAPTER_BYTES,
     ) -> list[DownloadedPage]:
         if not specs:
             raise SourceAuthError("章节图片规格列表为空")
 
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # 按 index 升序规范化输入，分配固定长度数组保证并发结果严格对位
         ordered_specs = sorted(specs, key=lambda s: s.index)
         total_pages = len(ordered_specs)
         slots: list[DownloadedPage | None] = [None] * total_pages
@@ -143,23 +260,34 @@ class ChapterImageDownloader:
 
                 cur_spec = spec
                 last_err = ""
+                raw_dest = dest_dir / f"{slot_idx + 1:04d}.raw"
+
                 for attempt in range(3):
                     if abort_exc is not None:
                         return
+                    remaining_budget = max_chapter_bytes - total_bytes
+                    if remaining_budget <= 0:
+                        last_err = "超出单话累计体积安全上限"
+                        break
+
+                    per_file_cap = min(MAX_SINGLE_IMAGE_BYTES, remaining_budget)
                     try:
-                        resp = await self._http.get(
+                        st_res = await _stream_or_fallback_get(
+                            self._http,
                             cur_spec.url,
+                            raw_dest,
                             headers=cur_spec.headers,
-                            max_bytes=MAX_SINGLE_IMAGE_BYTES,
+                            max_bytes=per_file_cap,
                         )
                     except Exception as exc:
+                        raw_dest.unlink(missing_ok=True)
                         last_err = str(exc)
                         if attempt < 2:
                             await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
-                    # Komiic HTTP 402：今日图片免费读取额度已达上限
-                    if resp.status == 402:
+                    if st_res.status == 402:
+                        raw_dest.unlink(missing_ok=True)
                         async with refresh_lock:
                             if not refreshed_once:
                                 refreshed_once = True
@@ -174,21 +302,23 @@ class ChapterImageDownloader:
                         )
                         return
 
-                    # 401 / 403：防盗链签名过期或 Cookie 失效，尝试刷新一次 URL/凭证
-                    if resp.status in (401, 403) and attempt == 0:
+                    if st_res.status in (401, 403) and attempt == 0:
+                        raw_dest.unlink(missing_ok=True)
                         new_spec = await source.refresh_single_page_url(manga, chapter, slot_idx)
                         if new_spec is not None:
                             cur_spec = new_spec
                             continue
 
-                    if resp.status != 200:
-                        last_err = f"HTTP {resp.status}"
+                    if st_res.status != 200:
+                        raw_dest.unlink(missing_ok=True)
+                        last_err = f"HTTP {st_res.status}"
                         if attempt < 2:
                             await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
-                    ext = detect_image_extension(resp.body)
+                    ext = detect_image_extension(st_res.head_bytes)
                     if ext is None:
+                        raw_dest.unlink(missing_ok=True)
                         last_err = "响应内容非有效图片格式"
                         if attempt == 0:
                             new_spec = await source.refresh_single_page_url(
@@ -201,20 +331,17 @@ class ChapterImageDownloader:
                             await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
-                    if total_bytes + len(resp.body) > MAX_CHAPTER_TOTAL_BYTES:
-                        last_err = "超出单话累计体积安全上限"
-                        break
-
-                    file_path = dest_dir / f"{slot_idx + 1:04d}{ext}"
-                    await asyncio.to_thread(file_path.write_bytes, resp.body)
-                    total_bytes += len(resp.body)
+                    final_path = dest_dir / f"{slot_idx + 1:04d}{ext}"
+                    await asyncio.to_thread(os.replace, raw_dest, final_path)
+                    total_bytes += st_res.size_bytes
                     slots[slot_idx] = DownloadedPage(
                         index=slot_idx,
-                        local_path=file_path,
-                        size_bytes=len(resp.body),
+                        local_path=final_path,
+                        size_bytes=st_res.size_bytes,
                     )
                     return
 
+                raw_dest.unlink(missing_ok=True)
                 logger.warning(
                     f"[{source.source_id.display_name}] 第 {slot_idx + 1}/{total_pages} 页下载失败 "
                     f"({manga.title} {chapter.title}): {last_err}"

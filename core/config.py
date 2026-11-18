@@ -74,8 +74,8 @@ class CommentsConfig:
 @dataclass(slots=True)
 class DeliveryConfig:
     include_header_node: bool = True
-    max_pages_per_forward: int = 60
-    max_mb_per_forward: int = 28
+    max_pages_per_forward: int = 50
+    max_mb_per_forward: int = 20
     send_wait_tip: bool = True
     recall_wait_tip: bool = True
 
@@ -84,8 +84,12 @@ class DeliveryConfig:
 class NetworkConfig:
     proxy: str = ""
     request_timeout_sec: int = 20
-    download_concurrency: int = 6
+    download_concurrency: int = 5
     max_concurrent_tasks: int = 2
+    max_waiting_tasks: int = 4
+    max_chapter_mb: int = 150
+    index_idle_unload_min: int = 10
+    cache_max_age_hours: int = 72
 
 
 @dataclass(slots=True)
@@ -209,8 +213,8 @@ class PluginConfig:
         dlv_raw = _as_dict(cfg.get("delivery"))
         dlv_cfg = DeliveryConfig(
             include_header_node=bool(dlv_raw.get("include_header_node", True)),
-            max_pages_per_forward=_clamp_int(dlv_raw.get("max_pages_per_forward"), 60, 10, 150),
-            max_mb_per_forward=_clamp_int(dlv_raw.get("max_mb_per_forward"), 28, 5, 80),
+            max_pages_per_forward=_clamp_int(dlv_raw.get("max_pages_per_forward"), 50, 10, 120),
+            max_mb_per_forward=_clamp_int(dlv_raw.get("max_mb_per_forward"), 20, 5, 60),
             send_wait_tip=bool(dlv_raw.get("send_wait_tip", True)),
             recall_wait_tip=bool(dlv_raw.get("recall_wait_tip", True)),
         )
@@ -219,8 +223,12 @@ class PluginConfig:
         net_cfg = NetworkConfig(
             proxy=str(net_raw.get("proxy") or "").strip(),
             request_timeout_sec=_clamp_int(net_raw.get("request_timeout_sec"), 20, 5, 120),
-            download_concurrency=_clamp_int(net_raw.get("download_concurrency"), 6, 1, 16),
+            download_concurrency=_clamp_int(net_raw.get("download_concurrency"), 5, 1, 16),
             max_concurrent_tasks=_clamp_int(net_raw.get("max_concurrent_tasks"), 2, 1, 10),
+            max_waiting_tasks=_clamp_int(net_raw.get("max_waiting_tasks"), 4, 1, 30),
+            max_chapter_mb=_clamp_int(net_raw.get("max_chapter_mb"), 150, 20, 500),
+            index_idle_unload_min=_clamp_int(net_raw.get("index_idle_unload_min"), 10, 1, 180),
+            cache_max_age_hours=_clamp_int(net_raw.get("cache_max_age_hours"), 72, 1, 720),
         )
 
         return cls(

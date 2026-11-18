@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+from pathlib import Path
 from typing import Any
 
 import astrbot.api.message_components as Comp
@@ -281,26 +283,148 @@ def build_forward_node_batches(
     return node_batches
 
 
+async def _unlink_files_safely(paths: list[Path]) -> None:
+    if not paths:
+        return
+
+    def _rm() -> None:
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    await asyncio.to_thread(_rm)
+
+
 async def send_chapter_forward_batches(
     event: AstrMessageEvent,
     bundle: ResolvedChapterBundle,
     delivery_cfg: DeliveryConfig,
 ) -> None:
-    """将构建好的合并转发批次依次投递至 OneBot v11 会话。"""
+    """逐批构建、发送合并转发并立即释放已发批次图片与内存，杜绝多批次 Base64 叠加内存溢出。"""
     bot_uin = resolve_bot_uin(event)
-    batches = build_forward_node_batches(bundle, delivery_cfg, bot_uin=bot_uin)
-    total_batches = len(batches)
+    total_pages = len(bundle.downloaded_pages)
+    max_pages = max(10, delivery_cfg.max_pages_per_forward)
+    max_bytes = max(5, delivery_cfg.max_mb_per_forward) * 1024 * 1024
 
-    for idx, nodes in enumerate(batches, start=1):
+    page_batches = _split_pages_into_batches(
+        bundle.downloaded_pages,
+        max_pages_per_batch=max_pages,
+        max_bytes_per_batch=max_bytes,
+    )
+    total_batches = len(page_batches)
+    manga_title = bundle.manga.title
+    chap_title = bundle.chapter.title
+    src_name = bundle.source.display_name
+
+    for b_idx, p_batch in enumerate(page_batches, start=1):
+        is_last_batch = b_idx == total_batches
+        single_bundle = ResolvedChapterBundle(
+            source=bundle.source,
+            manga=bundle.manga,
+            chapter=bundle.chapter,
+            downloaded_pages=p_batch,
+            comments=bundle.comments if is_last_batch else [],
+            comment_image_paths=bundle.comment_image_paths if is_last_batch else [],
+        )
+        # 复用单批构建逻辑但保留原始全话页数与分批编号标题
+        nodes: list[Comp.Node] = []
+        batch_files_to_free: list[Path] = []
+
+        if delivery_cfg.include_header_node:
+            part_suffix = f"（第 {b_idx}/{total_batches} 部分）" if total_batches > 1 else ""
+            header_lines = [
+                f"📖 《{manga_title}》 {chap_title}{part_suffix}",
+                f"来源：{src_name}  |  本话共 {total_pages} 页",
+            ]
+            if bundle.chapter.url:
+                header_lines.append(f"🔗 {bundle.chapter.url}")
+            nodes.append(
+                Comp.Node(
+                    uin=bot_uin,
+                    name=src_name,
+                    content=[Comp.Plain("\n".join(header_lines))],
+                )
+            )
+
+        for page in p_batch:
+            page_no = page.index + 1
+            node_title = f"{manga_title} · {chap_title} ({page_no}/{total_pages})"
+            if page.local_path is not None and page.local_path.exists():
+                batch_files_to_free.append(page.local_path)
+                img_comp = (
+                    Comp.Image.fromFileSystem(str(page.local_path))
+                    if hasattr(Comp.Image, "fromFileSystem")
+                    else Comp.Image(file=str(page.local_path))
+                )
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=node_title,
+                        content=[img_comp],
+                    )
+                )
+            else:
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=node_title,
+                        content=[Comp.Plain(f"⚠️ 第 {page_no}/{total_pages} 页图片源站加载失败")],
+                    )
+                )
+
+        if is_last_batch and single_bundle.source.supports_comments:
+            valid_comment_imgs = [
+                p for p in single_bundle.comment_image_paths if p is not None and p.exists()
+            ]
+            if valid_comment_imgs:
+                total_c_imgs = len(valid_comment_imgs)
+                for c_idx, c_path in enumerate(valid_comment_imgs, start=1):
+                    batch_files_to_free.append(c_path)
+                    c_img_comp = (
+                        Comp.Image.fromFileSystem(str(c_path))
+                        if hasattr(Comp.Image, "fromFileSystem")
+                        else Comp.Image(file=str(c_path))
+                    )
+                    c_node_name = (
+                        f"{src_name} · 章末吐槽 ({c_idx}/{total_c_imgs})"
+                        if total_c_imgs > 1
+                        else f"{src_name} · 章末吐槽"
+                    )
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=c_node_name,
+                            content=[c_img_comp],
+                        )
+                    )
+            elif single_bundle.comments:
+                comments_text = format_comments_text(single_bundle.comments, src_name)
+                if comments_text:
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=f"{src_name} · 章末吐槽",
+                            content=[Comp.Plain(comments_text)],
+                        )
+                    )
+
         try:
             await event.send(MessageChain(chain=[Comp.Nodes(nodes)]))
         except Exception as exc:
             if _is_timeout_exception(exc):
-                # 大批量高清漫画图片经协议端上传 QQ 服务器耗时较长，WebSocket 等待回包超时时协议端仍在后台继续上传，避免重复重发
                 logger.warning(
-                    f"合并转发批次 ({idx}/{total_batches}) 等待协议端回包超时，协议端后台继续上传中：{exc}"
+                    f"合并转发批次 ({b_idx}/{total_batches}) 等待协议端回包超时，协议端后台继续上传中：{exc}"
                 )
             else:
                 raise
-        if idx < total_batches:
+        finally:
+            # 本批发送返回后立即清理该批本地图片文件并释放 Node/Base64 内存引用
+            nodes.clear()
+            await _unlink_files_safely(batch_files_to_free)
+            if total_batches > 1:
+                gc.collect()
+
+        if b_idx < total_batches:
             await asyncio.sleep(1.0)

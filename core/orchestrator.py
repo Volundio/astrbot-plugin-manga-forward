@@ -30,6 +30,42 @@ from .sources.zmh_shadow_index import ZmhShadowSearchClient
 MIN_ACCEPT_MATCH_SCORE = 0.52
 
 
+class BoundedTaskLimiter:
+    """有界并发与等待队列背压控制器，防止极端刷屏请求无限堆积导致内存暴涨。"""
+
+    def __init__(self, max_concurrent: int, max_waiting: int) -> None:
+        self._max_concurrent = max(1, max_concurrent)
+        self._max_waiting = max(1, max_waiting)
+        self._active = 0
+        self._waiting = 0
+        self._cond = asyncio.Condition()
+
+    def update_limits(self, max_concurrent: int, max_waiting: int) -> None:
+        self._max_concurrent = max(1, max_concurrent)
+        self._max_waiting = max(1, max_waiting)
+
+    async def __aenter__(self) -> BoundedTaskLimiter:
+        async with self._cond:
+            if self._active >= self._max_concurrent:
+                if self._waiting >= self._max_waiting:
+                    raise MangaForwardError(
+                        f"当前漫画解析队列繁忙（执行中 {self._active}，排队 {self._waiting}），请稍后再试"
+                    )
+                self._waiting += 1
+                try:
+                    while self._active >= self._max_concurrent:
+                        await self._cond.wait()
+                finally:
+                    self._waiting -= 1
+            self._active += 1
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify(1)
+
+
 class MangaForwardOrchestrator:
     """核心业务编排器：按自定义源优先级检索、匹配章节、保序下载图片并渲染章末吐槽卡片。"""
 
@@ -72,8 +108,10 @@ class MangaForwardOrchestrator:
             ),
         }
 
-        self._max_tasks = cfg.network.max_concurrent_tasks
-        self._task_sem = asyncio.Semaphore(self._max_tasks)
+        self._task_limiter = BoundedTaskLimiter(
+            cfg.network.max_concurrent_tasks,
+            cfg.network.max_waiting_tasks,
+        )
 
     def current_config(self) -> PluginConfig:
         raw = self._get_raw_cfg()
@@ -93,11 +131,42 @@ class MangaForwardOrchestrator:
             timeout_sec=cfg.network.request_timeout_sec,
             proxy=cfg.network.proxy,
         )
-        if cfg.network.max_concurrent_tasks != self._max_tasks:
-            self._max_tasks = cfg.network.max_concurrent_tasks
-            self._task_sem = asyncio.Semaphore(self._max_tasks)
+        self._task_limiter.update_limits(
+            cfg.network.max_concurrent_tasks,
+            cfg.network.max_waiting_tasks,
+        )
+
+    def _clean_root_tmp_files_sync(self) -> int:
+        if not self._data_dir.exists():
+            return 0
+        removed = 0
+        for entry in list(self._data_dir.iterdir()):
+            if entry.is_file() and entry.suffix in (".tmp", ".part"):
+                entry.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
+    async def run_maintenance(self) -> tuple[bool, int]:
+        """后台周期巡检：释放长时间闲置的内存索引，清理过期索引分片与 `.tmp`/`.part` 垃圾文件。"""
+        cfg = self.current_config()
+        root_removed = await asyncio.to_thread(self._clean_root_tmp_files_sync)
+        evicted_ram, cache_removed = await self._zmh_shadow.run_maintenance(
+            idle_unload_sec=cfg.network.index_idle_unload_min * 60.0,
+            disk_max_age_sec=cfg.network.cache_max_age_hours * 3600.0,
+            source_enabled=cfg.zaimanhua.enabled,
+        )
+        return evicted_ram, root_removed + cache_removed
 
     async def close(self) -> None:
+        cfg = self.current_config()
+        try:
+            await self._zmh_shadow.run_maintenance(
+                idle_unload_sec=0.0,
+                disk_max_age_sec=cfg.network.cache_max_age_hours * 3600.0,
+                source_enabled=cfg.zaimanhua.enabled,
+            )
+        except Exception:
+            pass
         await self._http.close()
 
     async def resolve_and_download(
@@ -117,7 +186,7 @@ class MangaForwardOrchestrator:
         if not sources_order:
             raise AllSourcesFailedError([])
 
-        async with self._task_sem:
+        async with self._task_limiter:
             attempts: list[tuple[SourceId, str]] = []
             for src_id in sources_order:
                 source = self._sources[src_id]
@@ -215,6 +284,7 @@ class MangaForwardOrchestrator:
                         specs=page_specs,
                         dest_dir=dest_dir,
                         concurrency=cfg.network.download_concurrency,
+                        max_chapter_bytes=cfg.network.max_chapter_mb * 1024 * 1024,
                     ),
                     _safe_fetch_comments(),
                 )

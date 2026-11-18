@@ -37,7 +37,8 @@ else:
     from core.orchestrator import MangaForwardOrchestrator
 
 PLUGIN_NAME = "astrbot_plugin_manga_forward"
-TEMP_GC_INTERVAL_SEC = 180.0
+TEMP_GC_INTERVAL_SEC = 60.0
+TEMP_SCOPE_TTL_SEC = 180.0
 
 
 def _resolve_plugin_data_dir() -> Path:
@@ -64,7 +65,7 @@ class MangaForwardPlugin(Star):
         super().__init__(context)
         self.config: dict[str, Any] = config if config is not None else {}
         self._data_dir: Path = _resolve_plugin_data_dir()
-        self._temp_mgr = TempDirManager(self._data_dir / "temp", ttl_sec=600.0)
+        self._temp_mgr = TempDirManager(self._data_dir / "temp", ttl_sec=TEMP_SCOPE_TTL_SEC)
         self._orchestrator = MangaForwardOrchestrator(
             self._data_dir,
             lambda: self.config,
@@ -74,10 +75,12 @@ class MangaForwardPlugin(Star):
         self._terminated = False
 
     async def initialize(self) -> None:
-        """插件加载生命周期钩子：清理上次残留临时目录并启动后台巡检任务。"""
+        """插件加载生命周期钩子：清扫上次异常崩溃残留目录/垃圾缓存并启动每分钟巡检守护协程。"""
         self._terminated = False
         with contextlib.suppress(Exception):
-            await self._temp_mgr.cleanup_expired()
+            await self._temp_mgr.cleanup_expired(force_all_inactive=True)
+        with contextlib.suppress(Exception):
+            await self._orchestrator.run_maintenance()
         if self._gc_task is None or self._gc_task.done():
             self._gc_task = asyncio.create_task(self._gc_loop(), name=f"{PLUGIN_NAME}_temp_gc")
 
@@ -85,16 +88,23 @@ class MangaForwardPlugin(Star):
         try:
             while not self._terminated:
                 await asyncio.sleep(TEMP_GC_INTERVAL_SEC)
-                removed = await self._temp_mgr.cleanup_expired()
-                if removed > 0:
-                    logger.debug(f"已回收 {removed} 个过期的漫画临时图片目录。")
+                try:
+                    removed_temp = await self._temp_mgr.cleanup_expired()
+                    evicted_ram, removed_cache = await self._orchestrator.run_maintenance()
+                    if removed_temp > 0 or removed_cache > 0:
+                        logger.debug(
+                            f"自动清理完成：回收临时目录/垃圾文件 {removed_temp} 项，"
+                            f"索引缓存 {removed_cache} 项（内存索引卸载={evicted_ram}）。"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(f"漫画缓存与临时目录巡检单轮异常：{exc}")
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            logger.debug(f"漫画临时目录巡检异常：{exc}")
 
     async def terminate(self) -> None:
-        """插件停用/重载生命周期钩子：幂等取消后台任务并释放共享 HTTP 连接池。"""
+        """插件停用/重载生命周期钩子：幂等取消后台任务、卸载内存索引并清扫全部非活跃临时目录。"""
         self._terminated = True
         if self._gc_task is not None and not self._gc_task.done():
             self._gc_task.cancel()
@@ -103,7 +113,7 @@ class MangaForwardPlugin(Star):
         self._gc_task = None
         await self._orchestrator.close()
         with contextlib.suppress(Exception):
-            await self._temp_mgr.cleanup_expired()
+            await self._temp_mgr.cleanup_expired(force_all_inactive=True)
 
     @filter.command("manga")
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)

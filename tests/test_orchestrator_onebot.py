@@ -485,3 +485,168 @@ def test_metadata_and_conf_schema_integrity() -> None:
                     assert sub_spec.get("secret") is True, f"{key}.{sub_key} 必须设置 secret: true"
         else:
             assert "default" in spec
+
+
+@pytest.mark.asyncio
+async def test_temp_dir_active_scope_protection_and_budget_eviction(tmp_path: Path) -> None:
+    """验证 GC 清理崩溃残留与超限缓存时，绝不误删正在下载/发送中的活跃作用域文件。"""
+    temp_root = tmp_path / "temp"
+    mgr = TempDirManager(temp_root, ttl_sec=180.0, max_total_bytes=100)
+
+    active_scope = mgr.create_scope()
+    active_file = active_scope.subdir("copymanga") / "0001.png"
+    active_file.write_bytes(VALID_PNG_BYTES)
+
+    # 模拟进程上次崩溃遗留的非活跃目录与半截 .part 文件
+    orphan_dir = temp_root / "req_1700000000_deadbeef"
+    orphan_dir.mkdir(parents=True)
+    (orphan_dir / "leftover.jpg").write_bytes(b"x" * 200)
+    stray_part = temp_root / "dangling.part"
+    stray_part.write_bytes(b"partial")
+
+    removed = await mgr.cleanup_expired(force_all_inactive=True)
+    assert removed == 2
+    assert not orphan_dir.exists()
+    assert not stray_part.exists()
+    # 活跃作用域及其图片完好无损
+    assert active_file.exists()
+
+    await active_scope.cleanup()
+    assert not active_scope.path.exists()
+    await mgr.cleanup_expired()
+    assert not temp_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_bounded_task_limiter_backpressure() -> None:
+    """验证并发排队背压控制器在队列满载时立即快速拒绝，防止协程无限堆积导致 OOM。"""
+    from core.models import MangaForwardError
+    from core.orchestrator import BoundedTaskLimiter
+
+    limiter = BoundedTaskLimiter(max_concurrent=1, max_waiting=1)
+    entered_1 = asyncio.Event()
+    release_1 = asyncio.Event()
+    order: list[str] = []
+
+    async def _worker_1() -> None:
+        async with limiter:
+            order.append("w1_in")
+            entered_1.set()
+            await release_1.wait()
+            order.append("w1_out")
+
+    async def _worker_2() -> None:
+        async with limiter:
+            order.append("w2_in")
+
+    t1 = asyncio.create_task(_worker_1())
+    await entered_1.wait()
+
+    t2 = asyncio.create_task(_worker_2())
+    await asyncio.sleep(0.02)
+
+    # 此时 active=1 (t1), waiting=1 (t2)，第 3 个并发请求必须立即触发背压报错
+    with pytest.raises(MangaForwardError, match="队列繁忙"):
+        async with limiter:
+            pass
+
+    release_1.set()
+    await asyncio.gather(t1, t2)
+    assert order == ["w1_in", "w1_out", "w2_in"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_download_and_incremental_batch_file_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证 64KB 流式落盘及多批合并转发每发完一批立即删除该批磁盘图片释放内存/磁盘。"""
+    import core.onebot_sender as sender_mod
+    from core.http_client import HttpStreamResult
+    from core.models import DownloadedPage, ResolvedChapterBundle
+    from core.onebot_sender import send_chapter_forward_batches
+
+    # 避免测试等待批次间 1 秒间隔
+    async def _fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(sender_mod.asyncio, "sleep", _fast_sleep)
+
+    class _StreamingStubHttp:
+        async def stream_to_file(
+            self,
+            method: str,
+            url: str,
+            dest_path: Path,
+            *,
+            headers: dict[str, str] | None = None,
+            max_bytes: int = 1024 * 1024,
+            **_: Any,
+        ) -> HttpStreamResult:
+            payload = VALID_PNG_BYTES + b"S" * 64
+            assert len(payload) <= max_bytes
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(payload)
+            return HttpStreamResult(
+                status=200,
+                headers={},
+                size_bytes=len(payload),
+                head_bytes=payload[:32],
+            )
+
+    dl = ChapterImageDownloader(_StreamingStubHttp())  # type: ignore[arg-type]
+    stub_src = _StubSource(SourceId.COPYMANGA, page_count=12)
+    cand = MangaCandidate(source=SourceId.COPYMANGA, manga_id="m1", title="异剑战记")
+    chap = ChapterInfo(chapter_id="c2", title="第02话", number=2.0)
+    specs = await stub_src.fetch_chapter_pages(cand, chap)
+
+    pages_dir = tmp_path / "pages"
+    pages: list[DownloadedPage] = await dl.download_chapter_pages(
+        source=stub_src,
+        manga=cand,
+        chapter=chap,
+        specs=specs,
+        dest_dir=pages_dir,
+        concurrency=4,
+    )
+    assert len(pages) == 12
+    assert all(p.local_path is not None and p.local_path.exists() for p in pages)
+
+    cmt_img = tmp_path / "comments_p1.jpg"
+    cmt_img.write_bytes(VALID_PNG_BYTES)
+
+    bundle = ResolvedChapterBundle(
+        source=SourceId.COPYMANGA,
+        manga=cand,
+        chapter=chap,
+        downloaded_pages=pages,
+        comments=[ChapterComment(content="好耶")],
+        comment_image_paths=[cmt_img],
+    )
+
+    batch_disk_snapshots: list[tuple[bool, bool]] = []
+
+    class _InspectingEvent(_DummyEvent):
+        async def send(self, chain: Any) -> None:
+            self.sent_chains.append(chain)
+            if len(self.sent_chains) == 1:
+                # 第 1 批发送瞬间：第 1 批图片尚在，第 2 批图片也在
+                batch_disk_snapshots.append(
+                    (pages[0].local_path.exists(), pages[10].local_path.exists())  # type: ignore[union-attr]
+                )
+            elif len(self.sent_chains) == 2:
+                # 进入第 2 批发送时：第 1 批的 10 张图片已在上一批 finally 中被立即删除！
+                batch_disk_snapshots.append(
+                    (pages[0].local_path.exists(), pages[10].local_path.exists())  # type: ignore[union-attr]
+                )
+
+    ev = _InspectingEvent("aiocqhttp", "/manga 异剑战记 第二话")
+    await send_chapter_forward_batches(
+        ev,
+        bundle,
+        DeliveryConfig(include_header_node=True, max_pages_per_forward=10, max_mb_per_forward=20),
+    )
+    assert len(ev.sent_chains) == 2
+    assert batch_disk_snapshots == [(True, True), (False, True)]
+    # 全部批次发完后，所有正文图片与吐槽渲染图均已被即时回收
+    assert all(p.local_path is not None and not p.local_path.exists() for p in pages)
+    assert not cmt_img.exists()

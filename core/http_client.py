@@ -1,13 +1,15 @@
-"""异步 HTTP 客户端封装（基于 aiohttp，支持超时、代理、Cookie 提取与压缩容错）。"""
+"""异步 HTTP 客户端封装（基于 aiohttp，支持流式落盘防内存溢出、超时、代理与压缩容错）。"""
 
 from __future__ import annotations
 
 import asyncio
 import gzip
 import json
+import os
 import ssl
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -20,7 +22,7 @@ DEFAULT_USER_AGENT = (
 
 @dataclass(slots=True)
 class HttpResponseData:
-    """轻量级异步响应快照（脱离连接生命周期，避免连接泄漏）。"""
+    """轻量级异步响应快照（用于小型 JSON/HTML 接口，脱离连接生命周期）。"""
 
     status: int
     headers: dict[str, str]
@@ -42,11 +44,21 @@ class HttpResponseData:
         return json.loads(txt)
 
 
+@dataclass(slots=True)
+class HttpStreamResult:
+    """64KB 分块流式直写磁盘结果（不在内存中缓存完整图片字节，杜绝大图并发 OOM）。"""
+
+    status: int
+    headers: dict[str, str]
+    size_bytes: int
+    head_bytes: bytes
+    error_preview: str = ""
+
+
 def _extract_set_cookies(resp: aiohttp.ClientResponse) -> dict[str, str]:
     extracted: dict[str, str] = {}
     for k, morsel in resp.cookies.items():
         extracted[k] = morsel.value
-    # 补充解析多条原始 Set-Cookie 头，防止特殊字符 Cookie 被标准库丢弃
     raw_headers = resp.headers.getall("Set-Cookie", [])
     for raw_sc in raw_headers:
         sc = SimpleCookie()
@@ -97,7 +109,6 @@ class AsyncHttpClient:
                 ttl_dns_cache=300,
                 ssl=ssl_ctx,
             )
-            # 禁用 aiohttp 内部 CookieJar 自动串味，鉴权 Cookie 全部由 AuthManager 精确按源注入
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 cookie_jar=aiohttp.DummyCookieJar(),
@@ -121,7 +132,7 @@ class AsyncHttpClient:
         json_body: Any = None,
         form_data: dict[str, str] | None = None,
         timeout_sec: float | None = None,
-        max_bytes: int = 32 * 1024 * 1024,
+        max_bytes: int = 16 * 1024 * 1024,
         allow_ssl_Disable_retry: bool = False,
     ) -> HttpResponseData:
         session = await self._get_session()
@@ -168,6 +179,91 @@ class AsyncHttpClient:
                 return await _do_call(False)
             raise
 
+    async def stream_to_file(
+        self,
+        method: str,
+        url: str,
+        dest_path: Path,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: Any = None,
+        timeout_sec: float | None = None,
+        max_bytes: int = 18 * 1024 * 1024,
+    ) -> HttpStreamResult:
+        """按 64KB 分块流式下载并直接写入磁盘，仅保留前 32 字节用于格式嗅探，内存零驻留大图。"""
+        session = await self._get_session()
+        eff_timeout = aiohttp.ClientTimeout(total=timeout_sec or self._timeout_sec)
+        merged_headers = {"User-Agent": DEFAULT_USER_AGENT}
+        if headers:
+            merged_headers.update(headers)
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+        async with session.request(
+            method.upper(),
+            url,
+            headers=merged_headers,
+            json=json_body,
+            timeout=eff_timeout,
+            proxy=self._proxy,
+        ) as resp:
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            if resp.status != 200:
+                err_buf = bytearray()
+                async for chunk in resp.content.iter_chunked(4096):
+                    err_buf.extend(chunk)
+                    if len(err_buf) >= 512:
+                        break
+                preview = bytes(err_buf[:256]).decode("utf-8", errors="replace")
+                return HttpStreamResult(
+                    status=resp.status,
+                    headers=resp_headers,
+                    size_bytes=0,
+                    head_bytes=b"",
+                    error_preview=preview,
+                )
+
+            cl_str = resp_headers.get("content-length") or ""
+            if cl_str.isdigit() and int(cl_str) > max_bytes:
+                raise ValueError(f"远端声明文件体积超限 ({cl_str} > {max_bytes} bytes)")
+
+            head_buf = bytearray()
+            total_written = 0
+            fd = await asyncio.to_thread(
+                os.open,
+                str(part_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o644,
+            )
+            try:
+                async for chunk in resp.content.iter_chunked(65536):
+                    if not chunk:
+                        continue
+                    if len(head_buf) < 32:
+                        need = 32 - len(head_buf)
+                        head_buf.extend(chunk[:need])
+                    total_written += len(chunk)
+                    if total_written > max_bytes:
+                        raise ValueError(
+                            f"流式下载体积超出安全上限 ({total_written} > {max_bytes} bytes)"
+                        )
+                    await asyncio.to_thread(os.write, fd, chunk)
+            except BaseException:
+                await asyncio.to_thread(os.close, fd)
+                part_path.unlink(missing_ok=True)
+                raise
+            else:
+                await asyncio.to_thread(os.close, fd)
+
+            await asyncio.to_thread(os.replace, part_path, dest_path)
+            return HttpStreamResult(
+                status=200,
+                headers=resp_headers,
+                size_bytes=total_written,
+                head_bytes=bytes(head_buf),
+            )
+
     async def get(
         self,
         url: str,
@@ -175,7 +271,7 @@ class AsyncHttpClient:
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
         timeout_sec: float | None = None,
-        max_bytes: int = 32 * 1024 * 1024,
+        max_bytes: int = 16 * 1024 * 1024,
     ) -> HttpResponseData:
         return await self.request(
             "GET",

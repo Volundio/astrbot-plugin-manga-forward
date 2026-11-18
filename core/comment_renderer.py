@@ -1,9 +1,10 @@
-"""章末吐槽远程 HTML 渲染模块（调用 AstrBot `remote` / `astrbot-t2i-service`，默认 20 条一页）。"""
+"""章末吐槽远程 HTML 渲染模块（调用 AstrBot `remote` / `astrbot-t2i-service`，默认 20 条一页，流式落盘零残留）。"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,11 @@ MAX_RENDERED_COMMENT_IMAGE_BYTES = 12 * 1024 * 1024
 
 def load_comments_template() -> str:
     return TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def _read_head_sync(path: Path, n: int = 32) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(n)
 
 
 def normalize_t2i_endpoint(url: str) -> str:
@@ -50,7 +56,7 @@ def paginate_comments(
 
 
 class CommentCardRenderer:
-    """调用 AstrBot 远程 HTML 渲染服务将章末吐槽按 20 条/页渲染为图片。"""
+    """调用 AstrBot 远程 HTML 渲染服务将章末吐槽按 20 条/页流式渲染为图片。"""
 
     def __init__(self, *, context: Any, http: AsyncHttpClient) -> None:
         self._context = context
@@ -191,6 +197,7 @@ class CommentCardRenderer:
         )
 
         # 路径 1：优先复用本机 AstrBot 已初始化的 context.html_renderer (remote 策略)
+        # 仅读取前 32 字节校验图片头，并确保从 AstrBot 全局 temp 目录移入当前请求专属 TempScope，绝不在全局 temp 留垃圾文件
         if html_renderer is not None and hasattr(html_renderer, "render_custom_template"):
             render_fn = html_renderer.render_custom_template
             sig = inspect.signature(render_fn)
@@ -206,24 +213,56 @@ class CommentCardRenderer:
 
                 raw_path_str = await render_fn(self._tmpl_str, tmpl_data, **kwargs)
                 raw_path = Path(str(raw_path_str))
-                if raw_path.exists():
-                    data = await asyncio.to_thread(raw_path.read_bytes)
-                    ext = detect_image_extension(data) or ".jpg"
-                    target_path = dest_dir / f"comments_{page_idx:02d}{ext}"
-                    await asyncio.to_thread(shutil.move, str(raw_path), str(target_path))
-                    return target_path
+                try:
+                    if raw_path.exists():
+                        head = await asyncio.to_thread(_read_head_sync, raw_path, 32)
+                        ext = detect_image_extension(head) or ".jpg"
+                        target_path = dest_dir / f"comments_{page_idx:02d}{ext}"
+                        await asyncio.to_thread(shutil.move, str(raw_path), str(target_path))
+                        return target_path
+                finally:
+                    # 若 move 前发生异常，兜底清理 AstrBot 全局临时目录中可能残留的截图文件
+                    if raw_path.exists():
+                        raw_path.unlink(missing_ok=True)
 
-        # 路径 2：直接向远程 astrbot-t2i-service (`/text2img/generate`) 发起异步 POST
+        # 路径 2：直接向远程 astrbot-t2i-service (`/text2img/generate`) 发起异步流式 POST
         base_ep = effective_endpoint or await self._discover_official_endpoint()
         gen_url = f"{base_ep}/generate"
+        post_payload = {
+            "tmpl": self._tmpl_str,
+            "json": False,
+            "tmpldata": tmpl_data,
+            "options": options,
+        }
+
+        raw_dest = dest_dir / f"comments_{page_idx:02d}.raw"
+        stream_fn = getattr(self._http, "stream_to_file", None)
+        if callable(stream_fn):
+            st_res = await stream_fn(
+                "POST",
+                gen_url,
+                raw_dest,
+                json_body=post_payload,
+                timeout_sec=35.0,
+                max_bytes=MAX_RENDERED_COMMENT_IMAGE_BYTES,
+            )
+            if st_res.status != 200:
+                raw_dest.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"远程 HTML 渲染服务 ({gen_url}) 返回 HTTP {st_res.status}: {st_res.error_preview}"
+                )
+            ext = detect_image_extension(st_res.head_bytes)
+            if ext is None:
+                raw_dest.unlink(missing_ok=True)
+                raise RuntimeError("远程 HTML 渲染服务返回的字节流非合法图片格式")
+            target_path = dest_dir / f"comments_{page_idx:02d}{ext}"
+            await asyncio.to_thread(os.replace, raw_dest, target_path)
+            return target_path
+
+        # 兼容单元测试中仅实现 `.post()` 的桩客户端
         resp = await self._http.post(
             gen_url,
-            json_body={
-                "tmpl": self._tmpl_str,
-                "json": False,
-                "tmpldata": tmpl_data,
-                "options": options,
-            },
+            json_body=post_payload,
             timeout_sec=35.0,
         )
         if resp.status != 200:
@@ -237,5 +276,4 @@ class CommentCardRenderer:
 
         target_path = dest_dir / f"comments_{page_idx:02d}{ext}"
         await asyncio.to_thread(target_path.write_bytes, resp.body)
-        logger.debug(f"章末吐槽第 {page_idx} 页图片渲染完成 -> {target_path.name}")
         return target_path

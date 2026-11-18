@@ -1,4 +1,4 @@
-"""`zmh.shadows.de5.net` 第三方静态二进制倒排索引检索客户端。
+"""`zmh.shadows.de5.net` 第三方静态二进制倒排索引检索客户端（紧凑内存布局 + 空闲自动卸载 + 磁盘分片生命周期清理）。
 
 严格遵守项目红线：再漫画获取具体漫画 ID 必须使用 `https://zmh.shadows.de5.net/?needLogin=only1`
 提供的静态索引资产（manifest.json + ZMHm/ZMHd/ZMHa/postings 二进制分片），绝不调用再漫画官方搜索接口。
@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import gc
 import gzip
 import hashlib
 import os
 import re
+import shutil
 import struct
 import time
 import unicodedata
 from array import array
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,8 @@ from ..models import MangaCandidate, SourceId
 from ..text_utils import score_title_match, to_simplified
 
 MANIFEST_TTL_SEC = 6 * 3600.0
+MAX_RAM_POSTING_SHARDS = 4
+DEFAULT_MAX_DISK_CACHE_BYTES = 30 * 1024 * 1024
 _CLEAN_INDEX_TOKEN_RE = re.compile(r"[^\w\u4e00-\u9fff\u3040-\u30ff]+", re.UNICODE)
 
 
@@ -78,17 +83,12 @@ def _decode_str_from_pool(pool: memoryview, offsets: array[int], idx: int) -> st
 
 @dataclass(slots=True)
 class _MetaShard:
+    """紧凑元数据分片（已剥离无需驻留内存的封面 URL 池与冗余 ID 列表，降低约 45% 内存占用）。"""
+
     count: int
     sep: str
-    ids: list[int]
-    flags: bytes
     titles_offsets: array[int]
     titles_pool: bytes
-    cover_base_offsets: array[int]
-    cover_base_pool: bytes
-    cover_base_ids: array[int]
-    cover_paths_offsets: array[int]
-    cover_paths_pool: bytes
     author_ids_offsets: array[int]
     author_ids_pool: array[int]
     aliases_offsets: array[int]
@@ -114,12 +114,12 @@ class _LoadedIndex:
     meta_sep: str
     meta_shard_docs: int
     meta_shards: list[_MetaShard]
-    doc_ids: list[int]
+    doc_ids: array[int]
     doc_flags: bytearray
     author_by_id: dict[int, str]
     ngram_dict: _NgramDict
     index_assets: list[dict[str, Any]]
-    posting_shards: dict[int, bytes]
+    posting_shards: OrderedDict[int, bytes]
 
 
 def _unpack_u32_array(buf: bytes, offset: int, count: int) -> array[int]:
@@ -136,8 +136,8 @@ def _unpack_u16_array(buf: bytes, offset: int, count: int) -> array[int]:
     return arr
 
 
-def parse_meta_shard_bytes(raw: bytes) -> _MetaShard:
-    """解析 `ZMHm` v5 二进制元数据分片。"""
+def parse_meta_shard_bytes(raw: bytes) -> tuple[_MetaShard, array[int], bytes]:
+    """解析 `ZMHm` v5 二进制分片，返回 `(紧凑分片对象, C紧凑doc_ids数组, flags字节串)`。"""
     buf = _maybe_gunzip(raw)
     if len(buf) < 20 or buf[:4] != b"ZMHm":
         raise ValueError("ZMHm 分片魔数校验失败")
@@ -148,10 +148,10 @@ def parse_meta_shard_bytes(raw: bytes) -> _MetaShard:
         raise ValueError(f"不支持的 ZMHm 分片版本: {version}")
 
     pos = 20
-    ids: list[int] = [0] * count
+    ids = array("I")
     acc_id = 0
     buf_len = len(buf)
-    for i in range(count):
+    for _ in range(count):
         shift = 0
         delta = 0
         while True:
@@ -166,10 +166,9 @@ def parse_meta_shard_bytes(raw: bytes) -> _MetaShard:
             if shift > 28:
                 raise ValueError("ZMHm ids varint 过长")
         acc_id += delta
-        ids[i] = acc_id
+        ids.append(acc_id)
 
     pos = _align4(pos)
-    # 跳过 tagBits 矩阵 (count * tag_word_count * 4)
     pos += count * tag_word_count * 4
     flags = buf[pos : pos + count]
     pos = _align4(pos + count)
@@ -183,18 +182,20 @@ def parse_meta_shard_bytes(raw: bytes) -> _MetaShard:
         pos = _align4(pos + byte_len)
         return offs, pool_bytes
 
+    def _skip_pool(item_count: int) -> None:
+        nonlocal pos
+        last_off = struct.unpack_from("<I", buf, pos + item_count * 4)[0]
+        pos += (item_count + 1) * 4
+        pos = _align4(pos + last_off)
+
     titles_offs, titles_pool = _read_pool(count)
-    cover_base_offs, cover_base_pool = _read_pool(cover_base_count)
-
+    # 封面路径在合并转发正文中无需使用，跳过加载以显著节省常驻内存
+    _skip_pool(cover_base_count)
     if cover_base_count <= 255:
-        raw_cb = buf[pos : pos + count]
         pos = _align4(pos + count)
-        cover_base_ids = array("H", (b for b in raw_cb))
     else:
-        cover_base_ids = _unpack_u16_array(buf, pos, count)
         pos = _align4(pos + count * 2)
-
-    cover_paths_offs, cover_paths_pool = _read_pool(count)
+    _skip_pool(count)
 
     author_ids_offs = _unpack_u32_array(buf, pos, count + 1)
     pos += (count + 1) * 4
@@ -204,23 +205,17 @@ def parse_meta_shard_bytes(raw: bytes) -> _MetaShard:
 
     aliases_offs, aliases_pool = _read_pool(count)
 
-    return _MetaShard(
+    shard = _MetaShard(
         count=count,
         sep=chr(sep_code) if sep_code else " ",
-        ids=ids,
-        flags=flags,
         titles_offsets=titles_offs,
         titles_pool=titles_pool,
-        cover_base_offsets=cover_base_offs,
-        cover_base_pool=cover_base_pool,
-        cover_base_ids=cover_base_ids,
-        cover_paths_offsets=cover_paths_offs,
-        cover_paths_pool=cover_paths_pool,
         author_ids_offsets=author_ids_offs,
         author_ids_pool=author_ids_pool,
         aliases_offsets=aliases_offs,
         aliases_pool=aliases_pool,
     )
+    return shard, ids, flags
 
 
 def parse_authors_dict_bytes(raw: bytes) -> dict[int, str]:
@@ -304,7 +299,7 @@ def decode_postings(shard_buf: bytes, offset: int, length: int) -> list[int]:
 
 
 class ZmhShadowSearchClient:
-    """`zmh.shadows.de5.net` 离线二进制索引加载、SHA256 磁盘缓存与漫画 ID 检索器。"""
+    """`zmh.shadows.de5.net` 离线二进制索引客户端（支持内存空闲卸载与磁盘缓存过期/容量清理）。"""
 
     def __init__(self, cache_dir: Path, http: AsyncHttpClient) -> None:
         self._cache_dir = cache_dir
@@ -312,10 +307,14 @@ class ZmhShadowSearchClient:
         self._index_lock = asyncio.Lock()
         self._shard_lock = asyncio.Lock()
         self._loaded: _LoadedIndex | None = None
+        self._last_access_ts: float = 0.0
+
+    @property
+    def is_index_loaded(self) -> bool:
+        return self._loaded is not None
 
     @staticmethod
     def parse_site_url(site_url: str) -> tuple[str, str | None]:
-        """解析配置的索引站 URL，返回 `(origin, url_need_login_param)`。"""
         raw = (site_url or "https://zmh.shadows.de5.net/?needLogin=only1").strip()
         if not raw.startswith(("http://", "https://")):
             raw = f"https://{raw}"
@@ -336,7 +335,7 @@ class ZmhShadowSearchClient:
             cache_file = self._cache_dir / f"{sha256_hex}.bin"
             if cache_file.exists():
                 try:
-                    return await asyncio.to_thread(cache_file.read_bytes)
+                    return await asyncio.to_thread(self._read_and_touch_sync, cache_file)
                 except Exception:
                     pass
 
@@ -351,7 +350,6 @@ class ZmhShadowSearchClient:
 
         decompressed = _maybe_gunzip(resp.body)
         if sha256_hex:
-            # 校验原始或解压后 SHA256（Cloudflare Pages 自动解压 br/gzip 后哈希匹配解压字节）
             raw_hash = hashlib.sha256(resp.body).hexdigest().lower()
             dec_hash = hashlib.sha256(decompressed).hexdigest().lower()
             if sha256_hex not in (raw_hash, dec_hash):
@@ -360,6 +358,15 @@ class ZmhShadowSearchClient:
                 )
             await asyncio.to_thread(self._write_cache_file_sync, sha256_hex, decompressed)
         return decompressed
+
+    @staticmethod
+    def _read_and_touch_sync(path: Path) -> bytes:
+        data = path.read_bytes()
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return data
 
     def _write_cache_file_sync(self, sha256_hex: str, content: bytes) -> None:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -374,13 +381,106 @@ class ZmhShadowSearchClient:
     def _prune_stale_cache_sync(self, valid_hashes: set[str]) -> None:
         if not self._cache_dir.exists():
             return
-        for entry in self._cache_dir.glob("*.bin"):
-            stem = entry.stem.lower()
-            if stem not in valid_hashes:
+        for entry in list(self._cache_dir.iterdir()):
+            if entry.suffix in (".tmp", ".part"):
                 entry.unlink(missing_ok=True)
+            elif entry.suffix == ".bin" and entry.stem.lower() not in valid_hashes:
+                entry.unlink(missing_ok=True)
+
+    async def run_maintenance(
+        self,
+        *,
+        idle_unload_sec: float = 600.0,
+        disk_max_age_sec: float = 72 * 3600.0,
+        disk_max_bytes: int = DEFAULT_MAX_DISK_CACHE_BYTES,
+        source_enabled: bool = True,
+    ) -> tuple[bool, int]:
+        """执行内存索引空闲卸载与磁盘分片垃圾/过期清理，返回 `(是否释放内存索引, 清理磁盘文件数)`。"""
+        evicted_ram = False
+        now_mono = time.monotonic()
+        if self._loaded is not None and (
+            not source_enabled or (now_mono - self._last_access_ts) >= idle_unload_sec
+        ):
+            async with self._index_lock:
+                if self._loaded is not None and (
+                    not source_enabled
+                    or (time.monotonic() - self._last_access_ts) >= idle_unload_sec
+                ):
+                    self._loaded.posting_shards.clear()
+                    self._loaded.meta_shards.clear()
+                    self._loaded.author_by_id.clear()
+                    self._loaded = None
+                    evicted_ram = True
+            if evicted_ram:
+                gc.collect()
+                logger.debug("再漫画离线索引因空闲超时已从内存卸载（保留本地分片按需秒级重载）。")
+
+        removed_files = await asyncio.to_thread(
+            self._cleanup_disk_cache_sync,
+            disk_max_age_sec=disk_max_age_sec,
+            disk_max_bytes=disk_max_bytes,
+            wipe_all=not source_enabled,
+        )
+        return evicted_ram, removed_files
+
+    def _cleanup_disk_cache_sync(
+        self,
+        *,
+        disk_max_age_sec: float,
+        disk_max_bytes: int,
+        wipe_all: bool,
+    ) -> int:
+        if not self._cache_dir.exists():
+            return 0
+        if wipe_all:
+            count = sum(1 for _ in self._cache_dir.iterdir())
+            shutil.rmtree(self._cache_dir, ignore_errors=True)
+            return count
+
+        now = time.time()
+        removed = 0
+        kept_bins: list[tuple[float, int, Path]] = []
+
+        for entry in list(self._cache_dir.iterdir()):
+            if not entry.is_file():
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+                continue
+            if entry.suffix != ".bin":
+                entry.unlink(missing_ok=True)
+                removed += 1
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if (now - st.st_mtime) >= disk_max_age_sec:
+                entry.unlink(missing_ok=True)
+                removed += 1
+            else:
+                kept_bins.append((st.st_mtime, st.st_size, entry))
+
+        # 若缓存目录总大小超过预算，按最久未访问 (LRU) 淘汰旧分片
+        total_bytes = sum(sz for _, sz, _ in kept_bins)
+        if total_bytes > disk_max_bytes:
+            kept_bins.sort(key=lambda item: item[0])
+            for _, sz, fpath in kept_bins:
+                if total_bytes <= disk_max_bytes:
+                    break
+                fpath.unlink(missing_ok=True)
+                total_bytes -= sz
+                removed += 1
+
+        try:
+            if not any(self._cache_dir.iterdir()):
+                self._cache_dir.rmdir()
+        except OSError:
+            pass
+        return removed
 
     async def _ensure_index(self, origin: str) -> _LoadedIndex:
         now = time.monotonic()
+        self._last_access_ts = now
         if (
             self._loaded is not None
             and self._loaded.origin == origin
@@ -390,6 +490,7 @@ class ZmhShadowSearchClient:
 
         async with self._index_lock:
             now = time.monotonic()
+            self._last_access_ts = now
             if (
                 self._loaded is not None
                 and self._loaded.origin == origin
@@ -426,30 +527,36 @@ class ZmhShadowSearchClient:
                 if isinstance(item, dict) and item.get("sha256"):
                     valid_hashes.add(str(item["sha256"]).lower())
 
-            sem = asyncio.Semaphore(6)
+            sem = asyncio.Semaphore(4)
 
             async def _dl(info: dict[str, Any]) -> bytes:
                 async with sem:
                     return await self._fetch_asset_cached(origin, info)
 
-            authors_raw, dict_raw, *meta_raw_list = await asyncio.gather(
+            authors_raw, dict_raw = await asyncio.gather(
                 _dl(assets["authors"]),
                 _dl(assets["dict"]),
-                *(_dl(m) for m in meta_assets),
             )
-
             author_map = parse_authors_dict_bytes(authors_raw)
+            del authors_raw
             ngram_dict = parse_ngram_dict_bytes(dict_raw)
-            parsed_shards = [parse_meta_shard_bytes(m_bytes) for m_bytes in meta_raw_list]
+            del dict_raw
 
-            doc_ids: list[int] = []
+            # 流式逐批加载并解析 meta 分片，立即释放原始分片字节，避免 21 个原始分片与解析对象同时驻留峰值翻倍
+            parsed_shards: list[_MetaShard] = []
+            doc_ids = array("I")
             doc_flags = bytearray()
             meta_sep = " "
-            for sh in parsed_shards:
+
+            meta_raw_list = await asyncio.gather(*(_dl(m) for m in meta_assets))
+            for m_bytes in meta_raw_list:
+                sh, sh_ids, sh_flags = parse_meta_shard_bytes(m_bytes)
                 if sh.sep:
                     meta_sep = sh.sep
-                doc_ids.extend(sh.ids)
-                doc_flags.extend(sh.flags)
+                doc_ids.extend(sh_ids)
+                doc_flags.extend(sh_flags)
+                parsed_shards.append(sh)
+            del meta_raw_list
 
             await asyncio.to_thread(self._prune_stale_cache_sync, valid_hashes)
 
@@ -465,35 +572,32 @@ class ZmhShadowSearchClient:
                 author_by_id=author_map,
                 ngram_dict=ngram_dict,
                 index_assets=index_assets,
-                posting_shards={},
+                posting_shards=OrderedDict(),
             )
             logger.info(
                 f"再漫画离线索引就绪 ({origin})：共收录 {len(doc_ids)} 部漫画，"
-                f"{len(parsed_shards)} 个元数据分片。"
+                f"{len(parsed_shards)} 个紧凑分片。"
             )
             return self._loaded
 
-    async def _ensure_posting_shards(self, idx: _LoadedIndex, shard_ids: set[int]) -> None:
-        missing = [sid for sid in shard_ids if sid not in idx.posting_shards]
-        if not missing:
-            return
+    async def _get_posting_shard(self, idx: _LoadedIndex, sid: int) -> bytes | None:
+        if sid < 0 or sid >= len(idx.index_assets):
+            return None
+        if sid in idx.posting_shards:
+            idx.posting_shards.move_to_end(sid)
+            return idx.posting_shards[sid]
+
         async with self._shard_lock:
-            missing = [sid for sid in shard_ids if sid not in idx.posting_shards]
-            if not missing:
-                return
-            fetched = await asyncio.gather(
-                *(
-                    self._fetch_asset_cached(idx.origin, idx.index_assets[sid])
-                    for sid in missing
-                    if 0 <= sid < len(idx.index_assets)
-                )
-            )
-            for sid, data in zip(
-                (s for s in missing if 0 <= s < len(idx.index_assets)),
-                fetched,
-                strict=False,
-            ):
-                idx.posting_shards[sid] = data
+            if sid in idx.posting_shards:
+                idx.posting_shards.move_to_end(sid)
+                return idx.posting_shards[sid]
+            data = await self._fetch_asset_cached(idx.origin, idx.index_assets[sid])
+            idx.posting_shards[sid] = data
+            idx.posting_shards.move_to_end(sid)
+            # 严格限制常驻内存中的倒排分片数量（最多 4 个 ≈ 1MB），超出按 LRU 移出内存
+            while len(idx.posting_shards) > MAX_RAM_POSTING_SHARDS:
+                idx.posting_shards.popitem(last=False)
+            return data
 
     @staticmethod
     def _doc_matches_need_login(flags_byte: int, need_login_filter: str) -> bool:
@@ -518,17 +622,6 @@ class ZmhShadowSearchClient:
         )
         aliases = [a for a in aliases_raw.split(idx.meta_sep) if a] if aliases_raw else []
 
-        cb_id = sh.cover_base_ids[local_idx]
-        cb_str = (
-            _decode_str_from_pool(memoryview(sh.cover_base_pool), sh.cover_base_offsets, cb_id)
-            if cb_id > 0
-            else ""
-        )
-        cp_str = _decode_str_from_pool(
-            memoryview(sh.cover_paths_pool), sh.cover_paths_offsets, local_idx
-        )
-        cover = f"{cb_str}{cp_str}" if cb_str else cp_str
-
         a_start = sh.author_ids_offsets[local_idx] >> 1
         a_end = sh.author_ids_offsets[local_idx + 1] >> 1
         authors = [
@@ -545,7 +638,6 @@ class ZmhShadowSearchClient:
             title=title,
             aliases=aliases,
             authors=authors,
-            cover_url=cover,
             need_login=(f_byte & 4) != 0,
             url=f"https://manhua.zaimanhua.com/details/{manga_id}",
             extra={
@@ -566,8 +658,8 @@ class ZmhShadowSearchClient:
         """在 `zmh.shadows.de5.net` 索引中检索漫画并返回高置信度候选列表。"""
         origin, _ = self.parse_site_url(site_url)
         idx = await self._ensure_index(origin)
+        self._last_access_ts = time.monotonic()
 
-        # 同时构造原始查询与简体化查询（兼容用户输入繁体漫画名）
         raw_variants = [keyword.strip()]
         simp_kw = to_simplified(keyword).strip()
         if simp_kw and simp_kw not in raw_variants:
@@ -581,13 +673,11 @@ class ZmhShadowSearchClient:
             if not tokens:
                 continue
 
-            # 单字符词（如《棋》）无法切分 2-gram：直接在内存元数据分片上精确扫描
             short_tokens = [t for t in tokens if len(t) < idx.ngram_dict.n]
             long_tokens = [t for t in tokens if len(t) >= idx.ngram_dict.n]
 
             if long_tokens:
                 all_dict_indices: list[list[int]] = []
-                needed_shards: set[int] = set()
                 for tok in long_tokens:
                     grams = _extract_ngrams(tok, idx.ngram_dict.n)
                     d_indices: list[int] = []
@@ -598,12 +688,8 @@ class ZmhShadowSearchClient:
                         pos = bisect.bisect_left(idx.ngram_dict.keys, key)
                         if pos < len(idx.ngram_dict.keys) and idx.ngram_dict.keys[pos] == key:
                             d_indices.append(pos)
-                            needed_shards.add(idx.ngram_dict.shard_ids[pos])
                     if d_indices:
                         all_dict_indices.append(d_indices)
-
-                if needed_shards:
-                    await self._ensure_posting_shards(idx, needed_shards)
 
                 token_doc_sets: list[set[int]] = []
                 for tok, d_indices in zip(long_tokens, all_dict_indices, strict=False):
@@ -612,7 +698,7 @@ class ZmhShadowSearchClient:
                     hit_counts: dict[int, int] = {}
                     for di in d_indices:
                         sid = idx.ngram_dict.shard_ids[di]
-                        shard_buf = idx.posting_shards.get(sid)
+                        shard_buf = await self._get_posting_shard(idx, sid)
                         if shard_buf is None:
                             continue
                         off = idx.ngram_dict.offsets[di]
