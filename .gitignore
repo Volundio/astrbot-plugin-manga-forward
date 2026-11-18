@@ -1,0 +1,41 @@
+# Python 字节码与构建产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 测试 / 代码检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv*/
+venv/
+env/
+
+# IDE 与系统文件
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 运行时数据（统一存储于 AstrBot data/plugin_data/，切勿入库）
+data/
+*.log
+*.tmp
+*.bak
+
+# 本地开发规范与设计文档
+.env
+.env.*
+AGENTS.md
+agent.md
+DEVELOPMENT.md

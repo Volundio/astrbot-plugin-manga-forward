@@ -1,0 +1,283 @@
+{
+  "source_priority": {
+    "type": "list",
+    "description": "漫画源解析优先级顺序",
+    "hint": "排在前面的漫画源优先检索与解析；若未收录、无对应话数或源站受限，将自动按序回退至下一个漫画源。可清空后按期望的先后顺序依次点击选择。",
+    "default": [
+      "zaimanhua",
+      "copymanga",
+      "komiic"
+    ],
+    "options": [
+      "zaimanhua",
+      "copymanga",
+      "komiic"
+    ],
+    "labels": [
+      "再漫画 (Zaimanhua)",
+      "拷贝漫画 (CopyManga)",
+      "Komiic"
+    ],
+    "subtitles": [
+      "使用 zmh.shadows.de5.net 离线索引检索漫画 ID，支持隐藏漫画与章末吐槽",
+      "支持多域名自动切换、页序还原与章末吐槽",
+      "基于 GraphQL 接口检索与下载整话原图"
+    ]
+  },
+  "zaimanhua": {
+    "type": "object",
+    "description": "再漫画 (Zaimanhua) 配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用再漫画源",
+        "default": true
+      },
+      "search_site_url": {
+        "type": "string",
+        "description": "再漫画第三方索引站地址",
+        "hint": "严格使用该第三方静态索引站点检索漫画 ID，绝不调用再漫画官方搜索接口。",
+        "default": "https://zmh.shadows.de5.net/?needLogin=only1"
+      },
+      "need_login_filter": {
+        "type": "string",
+        "description": "再漫画索引站筛选范围",
+        "hint": "默认检索全部漫画（同时包含需登录的隐藏漫画与公开漫画）；也可限制仅检索需登录漫画。",
+        "default": "any",
+        "options": [
+          "any",
+          "only1",
+          "only0"
+        ],
+        "labels": [
+          "全部漫画（推荐，含需登录与公开）",
+          "仅需登录的隐藏漫画 (only1)",
+          "仅免登录公开漫画 (only0)"
+        ]
+      },
+      "username": {
+        "type": "string",
+        "description": "再漫画登录账号",
+        "hint": "填写用户名或手机号，配合下方密码自动登录并持久化保存 Cookie/Token，失效后自动重登刷新。",
+        "default": ""
+      },
+      "password": {
+        "type": "string",
+        "description": "再漫画登录密码",
+        "default": "",
+        "secret": true
+      },
+      "cookie": {
+        "type": "text",
+        "description": "直接配置再漫画 Cookie 或 Token（可选）",
+        "hint": "支持直接粘贴浏览器完整 Cookie 字符串（如含 token=...）或纯 JWT / Bearer Token。",
+        "default": "",
+        "secret": true
+      },
+      "prefer_cookie": {
+        "type": "bool",
+        "description": "同时配置账密与 Cookie 时优先使用手动 Cookie",
+        "hint": "开启后优先使用上方手动填写的 Cookie；当手动 Cookie 失效且配置了账号密码时，仍会自动登录兜底。",
+        "default": false
+      },
+      "auto_sign_in": {
+        "type": "bool",
+        "description": "每日自动执行再漫画签到",
+        "hint": "开启后，在登录态有效期间每日最多自动调用一次签到接口累积积分与等级。",
+        "default": false
+      }
+    }
+  },
+  "copymanga": {
+    "type": "object",
+    "description": "拷贝漫画 (CopyManga) 配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用拷贝漫画源",
+        "default": true
+      },
+      "api_domain": {
+        "type": "string",
+        "description": "拷贝漫画首选 API 域名",
+        "hint": "首选域名不可用时会自动尝试内置备用域名池与 Web 端解密通道。",
+        "default": "api.mangacopy.com"
+      },
+      "web_domain": {
+        "type": "string",
+        "description": "拷贝漫画 Web 兜底域名",
+        "default": "www.mangacopy.com"
+      },
+      "image_resolution": {
+        "type": "string",
+        "description": "拷贝漫画图片分辨率",
+        "default": "1500",
+        "options": [
+          "800",
+          "1200",
+          "1500"
+        ],
+        "labels": [
+          "标准 (800px)",
+          "高清 (1200px)",
+          "超清 (1500px，推荐)"
+        ]
+      },
+      "token": {
+        "type": "string",
+        "description": "拷贝漫画 Token（可选）",
+        "hint": "可选填写拷贝漫画登录 Token（无需带 Token 前缀）。",
+        "default": "",
+        "secret": true
+      }
+    }
+  },
+  "komiic": {
+    "type": "object",
+    "description": "Komiic 配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 Komiic 源",
+        "default": true
+      },
+      "base_url": {
+        "type": "string",
+        "description": "Komiic 站点地址",
+        "default": "https://komiic.com"
+      },
+      "username": {
+        "type": "string",
+        "description": "Komiic 登录邮箱账号",
+        "hint": "填写注册邮箱，配合下方密码自动登录并持久化保存 Cookie，临近过期自动刷新或重登以解除免费阅读图片次数限制。",
+        "default": ""
+      },
+      "password": {
+        "type": "string",
+        "description": "Komiic 登录密码",
+        "default": "",
+        "secret": true
+      },
+      "cookie": {
+        "type": "text",
+        "description": "直接配置 Komiic Cookie（可选）",
+        "hint": "支持直接粘贴含 komiic-access-token=... 的完整 Cookie 字符串或纯 JWT 值。",
+        "default": "",
+        "secret": true
+      },
+      "prefer_cookie": {
+        "type": "bool",
+        "description": "同时配置账密与 Cookie 时优先使用手动 Cookie",
+        "default": false
+      }
+    }
+  },
+  "comments": {
+    "type": "object",
+    "description": "单话评论 / 章末吐槽设置",
+    "items": {
+      "enable_comments": {
+        "type": "bool",
+        "description": "推送再漫画或拷贝漫画时附上单话评论/章末吐槽",
+        "hint": "开启后，在整话所有漫画图片节点的最后自动追加该话的热门评论/章末吐槽消息节点。",
+        "default": true
+      },
+      "max_comments": {
+        "type": "int",
+        "description": "章末最多展示的评论/吐槽条数",
+        "default": 20,
+        "slider": {
+          "min": 5,
+          "max": 50,
+          "step": 5
+        }
+      }
+    }
+  },
+  "delivery": {
+    "type": "object",
+    "description": "OneBot11 合并转发与发送设置",
+    "items": {
+      "include_header_node": {
+        "type": "bool",
+        "description": "合并转发首条附带章节信息概览",
+        "hint": "开启后首条节点展示漫画标题、话数、来源与总页数；其后每一张漫画图片严格独占一条转发消息。",
+        "default": true
+      },
+      "max_pages_per_forward": {
+        "type": "int",
+        "description": "单条合并转发最大页数",
+        "hint": "单话页数超过此上限时自动按序分批合并转发，避免触发 QQ NT / OneBot 节点数上限。",
+        "default": 60,
+        "slider": {
+          "min": 20,
+          "max": 100,
+          "step": 5
+        }
+      },
+      "max_mb_per_forward": {
+        "type": "int",
+        "description": "单条合并转发最大图片总体积 (MB)",
+        "hint": "超过此体积时自动切分下一批合并转发，防止单次 Base64 WebSocket 报文过大超时。",
+        "default": 28,
+        "slider": {
+          "min": 10,
+          "max": 60,
+          "step": 2
+        }
+      },
+      "send_wait_tip": {
+        "type": "bool",
+        "description": "解析下载前发送等待提示",
+        "default": true
+      },
+      "recall_wait_tip": {
+        "type": "bool",
+        "description": "发送完成后自动撤回等待提示",
+        "default": true
+      }
+    }
+  },
+  "network": {
+    "type": "object",
+    "description": "网络与并发限制",
+    "items": {
+      "proxy": {
+        "type": "string",
+        "description": "HTTP 代理地址（可选）",
+        "hint": "例如 http://127.0.0.1:7890，留空则直连。",
+        "default": ""
+      },
+      "request_timeout_sec": {
+        "type": "int",
+        "description": "单次请求超时时间（秒）",
+        "default": 20,
+        "slider": {
+          "min": 5,
+          "max": 60,
+          "step": 5
+        }
+      },
+      "download_concurrency": {
+        "type": "int",
+        "description": "单话图片并发下载数",
+        "default": 6,
+        "slider": {
+          "min": 1,
+          "max": 12,
+          "step": 1
+        }
+      },
+      "max_concurrent_tasks": {
+        "type": "int",
+        "description": "全局最大并发解析任务数",
+        "default": 2,
+        "slider": {
+          "min": 1,
+          "max": 6,
+          "step": 1
+        }
+      }
+    }
+  }
+}
