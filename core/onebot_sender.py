@@ -166,6 +166,17 @@ def _split_pages_into_batches(
     return batches
 
 
+def _format_missing_pages_notice(pages: list[DownloadedPage]) -> str:
+    """汇总当前批次（或全话）经多次重试仍失败的页码提示文本。"""
+    failed_nos = [p.index + 1 for p in pages if p.local_path is None or not p.local_path.exists()]
+    if not failed_nos:
+        return ""
+    preview = "、".join(str(n) for n in failed_nos[:8])
+    if len(failed_nos) > 8:
+        preview = f"{preview} 等"
+    return f"⚠️ 第 {preview} 页经多次重试仍加载失败（已在对应页码位置标注）"
+
+
 def build_forward_node_batches(
     bundle: ResolvedChapterBundle,
     delivery_cfg: DeliveryConfig,
@@ -204,6 +215,9 @@ def build_forward_node_batches(
                 f"📖 《{manga_title}》 {chap_title}{part_suffix}",
                 f"来源：{src_name}  |  本话共 {total_pages} 页",
             ]
+            missing_tip = _format_missing_pages_notice(p_batch)
+            if missing_tip:
+                header_lines.append(missing_tip)
             if bundle.chapter.url:
                 header_lines.append(f"🔗 {bundle.chapter.url}")
             nodes.append(
@@ -232,11 +246,16 @@ def build_forward_node_batches(
                     )
                 )
             else:
+                err_suffix = f"（{page.error}）" if page.error else ""
                 nodes.append(
                     Comp.Node(
                         uin=bot_uin,
                         name=node_title,
-                        content=[Comp.Plain(f"⚠️ 第 {page_no}/{total_pages} 页图片源站加载失败")],
+                        content=[
+                            Comp.Plain(
+                                f"⚠️ 第 {page_no}/{total_pages} 页图片经多次重试仍加载失败{err_suffix}"
+                            )
+                        ],
                     )
                 )
 
@@ -338,6 +357,9 @@ async def send_chapter_forward_batches(
                 f"📖 《{manga_title}》 {chap_title}{part_suffix}",
                 f"来源：{src_name}  |  本话共 {total_pages} 页",
             ]
+            missing_tip = _format_missing_pages_notice(p_batch)
+            if missing_tip:
+                header_lines.append(missing_tip)
             if bundle.chapter.url:
                 header_lines.append(f"🔗 {bundle.chapter.url}")
             nodes.append(
@@ -366,11 +388,16 @@ async def send_chapter_forward_batches(
                     )
                 )
             else:
+                err_suffix = f"（{page.error}）" if page.error else ""
                 nodes.append(
                     Comp.Node(
                         uin=bot_uin,
                         name=node_title,
-                        content=[Comp.Plain(f"⚠️ 第 {page_no}/{total_pages} 页图片源站加载失败")],
+                        content=[
+                            Comp.Plain(
+                                f"⚠️ 第 {page_no}/{total_pages} 页图片经多次重试仍加载失败{err_suffix}"
+                            )
+                        ],
                     )
                 )
 

@@ -809,3 +809,30 @@ async def test_http_stream_range_resume_on_content_length_truncation(tmp_path: P
         await http.close()
         server.close()
         await server.wait_closed()
+
+
+def test_missing_page_header_summary_and_placeholder_node(tmp_path: Path) -> None:
+    """验证中间某页经多次重试仍失败时，合并转发首条概览与对应页位均会明确提醒用户。"""
+    from core.models import DownloadedPage, ResolvedChapterBundle
+
+    p1 = tmp_path / "0001.png"
+    p3 = tmp_path / "0003.png"
+    p1.write_bytes(VALID_PNG_BYTES)
+    p3.write_bytes(VALID_PNG_BYTES)
+
+    bundle = ResolvedChapterBundle(
+        source=SourceId.ZAIMANHUA,
+        manga=MangaCandidate(source=SourceId.ZAIMANHUA, manga_id="60131", title="平屋小品"),
+        chapter=ChapterInfo(chapter_id="117888", title="1话", number=1.0),
+        downloaded_pages=[
+            DownloadedPage(index=0, local_path=p1, size_bytes=len(VALID_PNG_BYTES)),
+            DownloadedPage(index=1, local_path=None, error="HTTP 502"),
+            DownloadedPage(index=2, local_path=p3, size_bytes=len(VALID_PNG_BYTES)),
+        ],
+    )
+    batches = build_forward_node_batches(bundle, DeliveryConfig(), bot_uin="10000")
+    nodes = batches[0]
+    header_txt = nodes[0].content[0].text
+    slot2_txt = nodes[2].content[0].text
+    assert "⚠️ 第 2 页经多次重试仍加载失败" in header_txt
+    assert "⚠️ 第 2/3 页图片经多次重试仍加载失败（HTTP 502）" in slot2_txt
